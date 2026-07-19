@@ -1,0 +1,17 @@
+# Virtual environment (1.6 GB — never commit)
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Hugging Face / model caches
+.cache/
+
+# OS / editor
+.DS_Store
+*.log
