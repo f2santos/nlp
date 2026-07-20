@@ -222,8 +222,9 @@ def render_compare_years(subject_label, keyword, years, max_per_year):
 
     profiles = {y: nlp.compute_profile(d) for y, d in nonempty.items()}
 
-    tab_radar, tab_table, tab_vol, tab_kw = st.tabs(
-        ["🕸️ Radar", "📋 Metrics", "📊 Volume", "🔑 Keywords by year"]
+    tab_radar, tab_table, tab_vol, tab_evo, tab_kw = st.tabs(
+        ["🕸️ Radar", "📋 Metrics", "📊 Volume",
+         "📈 Term evolution", "🔑 Keywords by year"]
     )
 
     with tab_radar:
@@ -246,6 +247,40 @@ def render_compare_years(subject_label, keyword, years, max_per_year):
         st.bar_chart(vol)
         st.caption("How much the subject was published in each selected year "
                    "(capped at the 'papers per year' setting).")
+
+    with tab_evo:
+        st.subheader("How the top terms changed across years")
+        terms, yrs, matrix = nlp.term_evolution(nonempty, top_n=8, max_terms=20)
+        if terms and len(yrs) >= 2:
+            # prevalence as % ; rows = terms (most-changing first), cols = years
+            prev = pd.DataFrame(matrix, index=terms,
+                                columns=[str(y) for y in yrs]) * 100
+
+            heat = pgo.Figure(pgo.Heatmap(
+                z=prev.values[::-1],                 # flip so top row is on top
+                x=prev.columns.tolist(),
+                y=prev.index.tolist()[::-1],
+                colorscale="Blues",
+                colorbar=dict(title="% of papers"),
+                hovertemplate="%{y} — %{x}: %{z:.0f}% of papers<extra></extra>",
+            ))
+            heat.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10),
+                               xaxis_title="Year", yaxis_title="Term")
+            st.plotly_chart(heat, use_container_width=True)
+            st.caption("Colour = share of that year's papers mentioning the "
+                       "term. Terms are ordered by how much they changed "
+                       "(biggest movers on top).")
+
+            st.markdown("**Trajectories of the biggest movers**")
+            line_df = prev.T.iloc[:, :10]            # years as index, top movers
+            line_df.index.name = "Year"
+            st.line_chart(line_df)
+            st.caption("Each line is a term's prevalence (% of papers) over the "
+                       "selected years — rising lines are emerging topics, "
+                       "falling lines are fading ones.")
+        else:
+            st.info("Need at least two years with papers to show term "
+                    "evolution.")
 
     with tab_kw:
         st.subheader("Top terms in each year")

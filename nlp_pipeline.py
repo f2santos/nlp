@@ -364,6 +364,46 @@ def compute_profile(docs):
     }
 
 
+def term_evolution(by_year, top_n=8, max_terms=20):
+    """
+    Track how top terms rise/fall across years. Takes {year: [docs]}, picks the
+    union of each year's top-`top_n` TF-IDF terms, and computes each term's
+    PREVALENCE per year - the share of that year's papers mentioning it (0-1),
+    which is comparable across years regardless of how many papers each has.
+
+    Returns (terms, years, matrix) with matrix[i][j] = prevalence of terms[i]
+    in years[j], sorted so the terms that CHANGED most (largest max-min spread)
+    come first, capped at `max_terms`.
+    """
+    years = sorted(by_year)
+    # union of each year's top terms, order preserved
+    seen, terms = set(), []
+    for y in years:
+        for term, _ in extract_keywords(by_year[y], top_n=top_n):
+            if term not in seen:
+                seen.add(term)
+                terms.append(term)
+    if not terms:
+        return [], years, []
+
+    lowered = {y: [d.get("text", "").lower() for d in by_year[y]] for y in years}
+    matrix = []
+    for term in terms:
+        tl = term.lower()
+        row = []
+        for y in years:
+            texts = lowered[y]
+            n = len(texts) or 1
+            row.append(sum(1 for tx in texts if tl in tx) / n)
+        matrix.append(row)
+
+    # most-changing first (max - min prevalence across years)
+    order = sorted(range(len(terms)),
+                   key=lambda i: max(matrix[i]) - min(matrix[i]), reverse=True)
+    order = order[:max_terms]
+    return [terms[i] for i in order], years, [matrix[i] for i in order]
+
+
 # ---- 4. Summarization (optional LLM component, HF transformers) ----------
 
 @functools.lru_cache(maxsize=1)
