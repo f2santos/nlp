@@ -62,29 +62,17 @@ def _build_query(category, keyword=None):
     return query
 
 
-def search(category, max_results=50, keyword=None):
-    """
-    Fetch the latest papers in a category (most recently submitted first).
-
-    Returns the list of parsed feed entries (feedparser objects). Retries a
-    few times on transient network errors, since the arXiv API occasionally
-    rate-limits or times out.
-    """
-    params = {
-        "search_query": _build_query(category, keyword),
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-        "start": 0,
-        "max_results": min(int(max_results), 200),  # keep requests reasonable
-    }
+def _request_entries(params):
+    """Do one arXiv API request and return its parsed entries, retrying a few
+    times on transient network errors (the API occasionally rate-limits or
+    times out)."""
     last_err = None
     for attempt in range(1, SEARCH_RETRIES + 1):
         try:
             resp = requests.get(ENDPOINT, params=params, headers=HEADERS,
                                 timeout=SEARCH_TIMEOUT)
             resp.raise_for_status()
-            feed = feedparser.parse(resp.content)
-            return feed.entries
+            return feedparser.parse(resp.content).entries
         except (requests.exceptions.Timeout,
                 requests.exceptions.ConnectionError,
                 requests.exceptions.HTTPError) as e:
@@ -97,6 +85,79 @@ def search(category, max_results=50, keyword=None):
             if attempt < SEARCH_RETRIES:
                 time.sleep(RETRY_BACKOFF)
     raise last_err
+
+
+def search(category, max_results=50, keyword=None):
+    """
+    Fetch the latest papers in a category (most recently submitted first).
+    Returns a list of parsed feed entries (feedparser objects).
+    """
+    params = {
+        "search_query": _build_query(category, keyword),
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+        "start": 0,
+        "max_results": min(int(max_results), 200),  # keep requests reasonable
+    }
+    return _request_entries(params)
+
+
+def _year_query(category, year, keyword=None):
+    """Category query narrowed to a single calendar year via submittedDate."""
+    base = _build_query(category, keyword)
+    return f"{base} AND submittedDate:[{year}01010000 TO {year}12312359]"
+
+
+def search_paged(query, total, page_size=100, on_page=None):
+    """
+    Fetch up to `total` entries for a query, paging through the API in chunks
+    (arXiv caps a single response and asks us to page with `start`). We stay
+    polite with a short pause between pages. `on_page(fetched, total)` is an
+    optional progress callback. Returns the combined entry list.
+    """
+    total = min(int(total), 1000)
+    entries = []
+    start = 0
+    while start < total:
+        n = min(page_size, total - start)
+        batch = _request_entries({
+            "search_query": query,
+            "sortBy": "submittedDate",
+            "sortOrder": "descending",
+            "start": start,
+            "max_results": n,
+        })
+        if not batch:                    # no more results for this query
+            break
+        entries.extend(batch)
+        start += len(batch)
+        if on_page:
+            on_page(len(entries), total)
+        if len(batch) < n:               # reached the end of available results
+            break
+        if start < total:
+            time.sleep(RETRY_BACKOFF)     # be polite to the archive
+    return entries
+
+
+def collect_papers_by_year(category, years, max_per_year=200, keyword=None,
+                           progress=None):
+    """
+    Fetch up to `max_per_year` papers for a category in each requested year.
+    Returns an ordered dict {year: [doc, ...]} (years ascending). Years with no
+    papers (e.g. before the category existed) map to an empty list.
+    """
+    result = {}
+    years = sorted(set(int(y) for y in years))
+    for i, yr in enumerate(years):
+        if progress:
+            progress(i / len(years), f"Fetching {yr}...")
+        entries = search_paged(_year_query(category, yr, keyword), max_per_year)
+        result[yr] = [_entry_to_doc(e) for e in entries]
+        if progress:
+            progress((i + 1) / len(years),
+                     f"{yr}: {len(result[yr])} papers")
+    return result
 
 
 def _clean(text):

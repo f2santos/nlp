@@ -5,6 +5,17 @@ trend** in a scientific subject, using **real data** from the **arXiv API**.
 
 ## What it does
 
+The app has **two modes** (selectable in the sidebar):
+
+- **Latest trend** — analyse the most recent papers in a subject (below).
+- **Compare years** — fetch several hundred papers per year for a subject and
+  compare selected years (e.g. Machine Learning in 2010 vs 2020) on a
+  **radar/spider chart** of NLP-derived metrics: volume, collaboration
+  (authors/paper), abstract length, method density, cross-disciplinarity, and
+  lexical diversity. Includes per-year keyword tables and a volume chart.
+
+### Latest trend mode
+
 The user picks a subject (an arXiv category, e.g. *Computation & Language /
 NLP*), optionally refines it with a keyword, and the app:
 

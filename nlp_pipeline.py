@@ -320,6 +320,50 @@ def extract_entities(docs, max_chars=100000):
     return result
 
 
+# ---- 3b. Multi-metric profile (for cross-year radar comparison) ----------
+
+# The axes of the spider/radar chart, in display order.
+PROFILE_METRICS = [
+    "Papers",            # volume of activity
+    "Authors/paper",     # collaboration intensity
+    "Abstract length",   # avg words per abstract (descriptive depth)
+    "Methods/paper",     # acronym/method density (methodological richness)
+    "Categories/paper",  # cross-disciplinarity (avg arXiv cross-listings)
+    "Lexical diversity", # unique-terms / total-terms across the corpus
+]
+
+
+def compute_profile(docs):
+    """
+    Summarise a set of papers as a handful of comparable metrics, so two or
+    more years of the same subject can be plotted on a radar chart. Most axes
+    are per-paper averages (robust to how many papers each year has); "Papers"
+    is the raw volume. Returns { metric_name: value } for PROFILE_METRICS.
+    """
+    n = len(docs)
+    if n == 0:
+        return {m: 0 for m in PROFILE_METRICS}
+
+    authors = sum(len(d.get("authors", [])) for d in docs)
+    abs_words = sum(len(d.get("abstract", "").split()) for d in docs)
+    methods = sum(len(_scientific_terms(d.get("text", ""))) for d in docs)
+    cats = sum(len(d.get("categories", [])) for d in docs)
+
+    tokens = []
+    for d in docs:
+        tokens.extend(preprocess(d.get("text", "")))
+    ttr = len(set(tokens)) / len(tokens) if tokens else 0.0
+
+    return {
+        "Papers": n,
+        "Authors/paper": round(authors / n, 2),
+        "Abstract length": round(abs_words / n, 1),
+        "Methods/paper": round(methods / n, 2),
+        "Categories/paper": round(cats / n, 2),
+        "Lexical diversity": round(ttr, 3),
+    }
+
+
 # ---- 4. Summarization (optional LLM component, HF transformers) ----------
 
 @functools.lru_cache(maxsize=1)
