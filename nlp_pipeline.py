@@ -237,7 +237,7 @@ def _discover_topics_bertopic(docs, n_topics, terms_per_topic):
     return topics
 
 
-# ---- 3. Named Entity Recognition (spaCy) ---------------------------------
+# ---- 3. Entity extraction: methods/models (rules) + institutions (spaCy) --
 
 @functools.lru_cache(maxsize=1)
 def _load_spacy():
@@ -250,25 +250,74 @@ def _load_spacy():
         return spacy.load("en_core_web_sm")
 
 
+# All-caps tokens that are common English words / boilerplate, not methods.
+_ACRONYM_STOP = {
+    "THE", "AND", "FOR", "WITH", "THIS", "THAT", "FROM", "WE", "OUR", "ARE",
+    "CAN", "NOT", "USE", "USING", "PDF", "URL", "HTML", "III", "II", "IV",
+    "USA", "UK", "EU", "OK",
+}
+
+
+def _scientific_terms(text):
+    """
+    Rule-based extraction of the entities that actually matter in research:
+    methods, models, datasets and named systems. These show up as acronyms or
+    CamelCase names (LLM, GAN, RLHF, BERT, ResNet, ImageNet, GPT-4), i.e. tokens
+    with two or more capital letters. Cheap, model-free, and domain-agnostic
+    across all arXiv fields (unlike a general-purpose newswire NER).
+    """
+    out = []
+    for tok in re.findall(r"[A-Za-z][A-Za-z0-9\-]{1,15}", text):
+        caps = sum(1 for c in tok if c.isupper())
+        if caps >= 2 and tok.upper() not in _ACRONYM_STOP:
+            out.append(tok)
+    return out
+
+
 def extract_entities(docs, max_chars=100000):
     """
-    Run spaCy NER over the concatenated abstracts. For research text the most
-    useful buckets are organisations (labs/universities), people (named methods
-    or authors), and places. Returns {label: [(entity, count), ...]}.
+    Surface the entities that are meaningful for a scientific trend, in two
+    buckets, returned as {label: [(entity, count), ...]}:
+
+      - "METHOD"  : methods / models / datasets / named systems, via a
+                    rule-based acronym/CamelCase matcher (LLM, GAN, BERT, ...).
+                    The abbreviated form of "what techniques are trending".
+      - "CONCEPT" : named techniques / concepts via spaCy NER - the spelled-out
+                    form (Reinforcement Learning, Convolutional Neural Networks).
+
+    We deliberately drop PERSON/GPE/NORP/LOC: for research abstracts those are
+    mostly noise (author names, country mentions) rather than trend signal.
     """
+    blob = " ".join(_corpus(docs))[:max_chars]   # original case preserved
+    result = {}
+
+    # 1. methods / models / acronyms (rule-based, no model needed)
+    terms = Counter(_scientific_terms(blob))
+    if terms:
+        result["METHOD"] = terms.most_common(15)
+    method_set = set(terms)
+
+    # 2. named techniques / concepts via spaCy NER. Abstracts don't contain
+    #    author affiliations, so spaCy's ORG/PRODUCT hits on scientific text are
+    #    almost never real institutions - they are capitalised named techniques
+    #    and concepts ("Reinforcement Learning", "Convolutional Neural
+    #    Networks"). We keep those: multi-word Title-Case phrases (the richest
+    #    signal) or mixed-case named tokens, de-duplicated against the acronyms.
     nlp = _load_spacy()
-    blob = " ".join(_corpus(docs))[:max_chars]
     doc = nlp(blob)
-
-    keep = {"ORG", "PERSON", "GPE", "PRODUCT", "NORP", "LOC"}
-    buckets = {}
+    concepts = Counter()
     for ent in doc.ents:
-        if ent.label_ in keep:
-            txt = ent.text.strip()
-            if len(txt) > 1:
-                buckets.setdefault(ent.label_, Counter())[txt] += 1
+        if ent.label_ not in ("ORG", "PRODUCT", "WORK_OF_ART"):
+            continue
+        txt = ent.text.strip()
+        multiword = " " in txt
+        mixed_case = any(c.islower() for c in txt) and any(c.isupper() for c in txt)
+        if (multiword or (mixed_case and len(txt) >= 4)) and txt not in method_set:
+            concepts[txt] += 1
+    if concepts:
+        result["CONCEPT"] = concepts.most_common(12)
 
-    return {label: counter.most_common(10) for label, counter in buckets.items()}
+    return result
 
 
 # ---- 4. Summarization (optional LLM component, HF transformers) ----------

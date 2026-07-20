@@ -145,20 +145,23 @@ if go:
             st.info("Not enough papers to detect distinct sub-topics. "
                     "Increase the number of papers.")
 
-    # NER
+    # Entities (methods/models + named concepts)
     with tab_ner:
-        st.subheader("Named entities (spaCy)")
-        with st.spinner("Running NER..."):
+        st.subheader("Methods, models & named concepts")
+        with st.spinner("Extracting entities..."):
             ents = nlp.extract_entities(docs)
-        labels = {"ORG": "Organisations", "PERSON": "People",
-                  "GPE": "Places/Countries", "PRODUCT": "Products/Systems",
-                  "NORP": "Groups/Nationalities", "LOC": "Locations"}
+        labels = {"METHOD": "Methods / models / systems (acronyms)",
+                  "CONCEPT": "Named techniques & concepts (spaCy NER)"}
         if not ents:
             st.info("No entities detected.")
-        for label, items in ents.items():
-            st.markdown(f"**{labels.get(label, label)}**")
-            edf = pd.DataFrame(items, columns=["Entity", "Mentions"])
-            st.dataframe(edf, use_container_width=True, hide_index=True)
+        for label in ("METHOD", "CONCEPT"):
+            if label in ents:
+                st.markdown(f"**{labels.get(label, label)}**")
+                edf = pd.DataFrame(ents[label], columns=["Entity", "Mentions"])
+                st.dataframe(edf, use_container_width=True, hide_index=True)
+        st.caption("Acronyms come from a rule-based matcher (works across all "
+                   "arXiv fields); the spelled-out named concepts come from "
+                   "spaCy NER. Together they show which techniques are trending.")
 
     # Trend report (headline tab)
     with tab_report:
