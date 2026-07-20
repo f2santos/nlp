@@ -41,6 +41,31 @@ NLP*), optionally refines it with a keyword, and the app:
 > abstracts, whereas discovering sub-topics is exactly what "trend analysis"
 > needs. Topic discovery is an unsupervised form of text classification.
 
+### Newsletter pessoal
+
+A second area ("MindFeed" landing page → *Newsletter pessoal*) turns what you
+search in *Explorar tendências* into a personalised weekly digest, generated
+by a small **agentic pipeline** (`newsletter_agent.py`):
+
+1. **Compact context** — aggregates your recent searches (categories/keywords)
+   into a short interest profile.
+2. **Plan queries** — the local LLM decides 1–3 arXiv searches to run for
+   that profile.
+3. **Fetch candidates** — via the same `arxiv_api.collect_papers` used by the
+   search tool.
+4. **Select top 10** — candidates are clustered by sub-topic (reusing
+   `nlp_pipeline.discover_topics`), then the LLM picks a relevant *and*
+   diverse top 10 across clusters.
+5. **Summaries + preview** — one batched LLM call writes a short summary per
+   article plus the week's preview blurb.
+6. **Quality-control loop** — deterministic checks (10 unique items,
+   non-empty summaries) plus one LLM "critic" pass; if either flags issues,
+   the pipeline retries up to 2 times before accepting its best draft.
+
+Results are cached per ISO week under `data/newsletter_cache/`, so opening
+the page is instant except the first time each week (or after clicking
+"Gerar novamente esta semana").
+
 ## How to run locally
 
 ```bash
@@ -52,6 +77,16 @@ streamlit run app.py
 
 > Requires Python **3.13** (spaCy has no wheels for 3.14 yet). The first run
 > downloads the spaCy and transformers models (1–2 min), then caches them.
+
+> The Newsletter's local LLM (`Qwen/Qwen2.5-1.5B-Instruct`, ~3 GB) downloads
+> the first time you open *Newsletter pessoal*. Each weekly generation runs
+> several sequential local calls (planning, selection, summaries, critique),
+> so it can take **1–3 minutes on CPU** — it's cached per week afterwards, so
+> this only happens once a week (or when you force a regeneration).
+
+> On Windows PowerShell, `source .venv/bin/activate` doesn't exist — either run
+> `.venv\Scripts\Activate.ps1` first, or skip activation and call the venv's
+> Python directly: `.\.venv\Scripts\python.exe -m streamlit run app.py`.
 
 ## Free deploy on Streamlit Community Cloud
 
@@ -66,15 +101,25 @@ streamlit run app.py
 
 ## Structure
 
-| File               | Role                                                |
-|--------------------|-----------------------------------------------------|
-| `app.py`           | Streamlit UI and orchestration                      |
-| `arxiv_api.py`     | Data layer (arXiv API + category taxonomy)          |
-| `nlp_pipeline.py`  | NLP pipeline (keywords, topics, NER, summary, report) |
-| `requirements.txt` | Dependencies                                         |
+| File                  | Role                                                |
+|-----------------------|-----------------------------------------------------|
+| `app.py`              | Streamlit UI and orchestration                      |
+| `arxiv_api.py`        | Data layer (arXiv API + category taxonomy)          |
+| `nlp_pipeline.py`     | NLP pipeline (keywords, topics, NER, summary, report) |
+| `newsletter_agent.py` | Agentic pipeline behind the personal newsletter (local LLM: context → query planning → selection → summaries → quality-control loop) |
+| `requirements.txt`    | Dependencies                                         |
+| `data/`               | Local runtime state: search history + weekly newsletter cache. **Not committed** (see `.gitignore`) — it's personal, regenerable, and shouldn't be shared between users. |
 
 ## Notes
 
-- No paid API keys: everything runs on open models.
-- The LLM component (summary) is **optional** and **complements** the pipeline.
+- No paid API keys: everything runs on open models — including the
+  Newsletter's LLM (`Qwen/Qwen2.5-1.5B-Instruct`, local via `transformers`).
+  It's a different, larger model than the `distilBART` used for the
+  trend-report summary: that one only needs short extractive-style
+  summarisation, while the newsletter pipeline needs to follow instructions
+  and reliably return structured JSON (query planning, selection, critique).
+- The LLM components (trend-report summary, newsletter pipeline) are
+  **optional/isolated** and **complement** the deterministic NLP pipeline —
+  the app still works with the summary checkbox off, or before any
+  newsletter has been generated.
 - Simplicity over complexity, as the brief asks.

@@ -1,0 +1,478 @@
+"""
+newsletter_agent.py
+--------------------
+Agentic pipeline behind the "Newsletter pessoal" page: turns what the user
+searches in "Explorar tendências" into a personalised weekly digest, using a
+local instruction-tuned LLM (no paid API key — same "open models only"
+principle as the distilBART summariser in nlp_pipeline.py).
+
+Pipeline (deterministic multi-step, with a bounded quality-control loop):
+
+    compact_context -> plan_queries -> fetch_candidates -> select_top10
+        -> summarize_and_preview -> critique -> (refine, up to MAX_REFINE_LOOPS)
+
+Results are cached per ISO week in data/newsletter_cache/, so the LLM and
+the arXiv API are only hit when the week changes or the user forces a
+regeneration — not on every page view.
+"""
+
+import datetime
+import functools
+import json
+import re
+from collections import Counter
+from pathlib import Path
+
+import arxiv_api
+import nlp_pipeline as nlp
+
+LLM_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+MAX_REFINE_LOOPS = 1
+TOP_N = 10
+MAX_CANDIDATES = 24  # hard cap on candidates fed to the LLM — keeps prompts
+                     # (and CPU prefill time) bounded regardless of query count
+
+DATA_DIR = Path(__file__).parent / "data"
+HISTORY_PATH = DATA_DIR / "search_history.jsonl"
+CACHE_DIR = DATA_DIR / "newsletter_cache"
+
+MONTHS_PT = ["", "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+             "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
+
+# Bootstrap profile used only when there is no search history yet, so the
+# newsletter is never empty on first use.
+DEFAULT_PROFILE = {
+    "categories": ["cs.CL", "cs.AI"],
+    "keywords": ["retrieval augmented generation"],
+}
+
+
+# ==========================================================================
+#  Local LLM — lazy singleton, chat-template prompting, JSON-tolerant parsing
+# ==========================================================================
+@functools.lru_cache(maxsize=1)
+def _load_llm():
+    from transformers import pipeline
+    # No device_map="auto" here: on this CPU-only machine, accelerate's
+    # automatic dispatch mis-estimates available memory and tries to
+    # disk-offload part of the model, which errors without an
+    # offload_folder. The model comfortably fits in RAM, so just load it
+    # straight onto the default (CPU) device.
+    return pipeline("text-generation", model=LLM_MODEL_NAME, dtype="auto")
+
+
+def _try_parse_json(text):
+    match = re.search(r"\{.*\}|\[.*\]", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def _chat(system, user, max_new_tokens=300, expect_json=False):
+    """Run one chat-formatted generation. If expect_json, try to parse the
+    output as JSON, with one corrective retry if parsing fails — this retry
+    is the module's cheapest, most common form of self-correction."""
+    gen = _load_llm()
+    tok = gen.tokenizer
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": user}]
+    prompt = tok.apply_chat_template(messages, tokenize=False,
+                                     add_generation_prompt=True)
+    out = gen(prompt, max_new_tokens=max_new_tokens, do_sample=False,
+              return_full_text=False, pad_token_id=tok.eos_token_id)
+    text = out[0]["generated_text"].strip()
+    if not expect_json:
+        return text
+
+    data = _try_parse_json(text)
+    if data is not None:
+        return data
+
+    messages.append({"role": "assistant", "content": text})
+    messages.append({"role": "user", "content": (
+        f"A tua resposta anterior não era JSON válido:\n{text}\n\n"
+        "Responde APENAS com JSON válido, sem texto à volta.")})
+    prompt2 = tok.apply_chat_template(messages, tokenize=False,
+                                      add_generation_prompt=True)
+    out2 = gen(prompt2, max_new_tokens=max_new_tokens, do_sample=False,
+               return_full_text=False, pad_token_id=tok.eos_token_id)
+    return _try_parse_json(out2[0]["generated_text"].strip())
+
+
+# ==========================================================================
+#  Search history — what feeds the compacted context
+# ==========================================================================
+def record_search(subject_label, category, keyword, mode):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    entry = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+             "mode": mode, "subject_label": subject_label,
+             "category": category, "keyword": keyword or ""}
+    with open(HISTORY_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def load_recent_history(days=30):
+    if not HISTORY_PATH.exists():
+        return []
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+    out = []
+    with open(HISTORY_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                ts = datetime.datetime.fromisoformat(entry["ts"])
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+            if ts >= cutoff:
+                out.append(entry)
+    return out
+
+
+# ==========================================================================
+#  Step 1 — compact context
+# ==========================================================================
+def compact_context(history):
+    if not history:
+        return {
+            "summary": ("Ainda sem pesquisas registadas — a mostrar "
+                        "sugestões iniciais alinhadas com RAG e IA aplicada."),
+            "top_categories": DEFAULT_PROFILE["categories"],
+            "top_keywords": DEFAULT_PROFILE["keywords"],
+            "n_searches": 0,
+        }
+
+    cat_counts = Counter(h["category"] for h in history if h.get("category"))
+    kw_counts = Counter(h["keyword"] for h in history if h.get("keyword"))
+    top_categories = [c for c, _ in cat_counts.most_common(3)] \
+        or DEFAULT_PROFILE["categories"]
+    top_keywords = [k for k, _ in kw_counts.most_common(3)]
+
+    stats_text = (f"{len(history)} pesquisas recentes. Categorias mais "
+                 f"pesquisadas: {', '.join(top_categories)}."
+                 + (f" Palavras-chave: {', '.join(top_keywords)}."
+                    if top_keywords else ""))
+
+    summary = _chat(
+        system=("És um assistente que resume interesses de investigação em "
+               "português europeu, em 1-2 frases curtas e naturais, sem "
+               "introduções como 'Aqui está'."),
+        user=f"Estatísticas de pesquisa de um utilizador:\n{stats_text}\n\n"
+            "Escreve um resumo curto (1-2 frases) do que este utilizador "
+            "parece estar a investigar ultimamente.",
+        max_new_tokens=100,
+    )
+    return {"summary": (summary or "").strip() or stats_text,
+           "top_categories": top_categories, "top_keywords": top_keywords,
+           "n_searches": len(history)}
+
+
+# ==========================================================================
+#  Step 2 — plan arXiv queries
+# ==========================================================================
+def _sanitize_queries(result, context):
+    valid_categories = set(arxiv_api.CATEGORIES.values())
+    queries = []
+    if isinstance(result, list):
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            cat = item.get("category")
+            if cat in valid_categories:
+                queries.append({"category": cat,
+                               "keyword": (item.get("keyword") or "").strip()})
+    if not queries:
+        cats = context["top_categories"] or DEFAULT_PROFILE["categories"]
+        kw = (context["top_keywords"][0] if context["top_keywords"]
+             else DEFAULT_PROFILE["keywords"][0])
+        queries = [{"category": c, "keyword": kw} for c in cats[:2]]
+    return queries[:3]
+
+
+def plan_queries(context):
+    user_prompt = (
+        f"Contexto do utilizador: {context['summary']}\n"
+        f"Categorias mais pesquisadas: "
+        f"{', '.join(context['top_categories']) or 'nenhuma'}\n"
+        f"Palavras-chave: {', '.join(context['top_keywords']) or 'nenhuma'}\n"
+        f"Categorias arXiv válidas: {', '.join(arxiv_api.CATEGORIES.values())}\n\n"
+        "Sugere entre 1 e 3 pesquisas no arXiv para encontrar os papers mais "
+        "relevantes para este utilizador esta semana. Responde APENAS com "
+        'JSON: uma lista de objetos {"category": "<código arXiv válido>", '
+        '"keyword": "<palavra-chave ou vazio>"}.'
+    )
+    result = _chat(
+        system=("És um assistente de investigação que decide que pesquisas "
+               "fazer no arXiv para satisfazer os interesses de um "
+               "utilizador."),
+        user=user_prompt, max_new_tokens=120, expect_json=True,
+    )
+    return _sanitize_queries(result, context)
+
+
+def fetch_candidates(queries, per_query=10):
+    seen = set()
+    candidates = []
+    for q in queries:
+        docs = arxiv_api.collect_papers(q["category"], max_results=per_query,
+                                        keyword=q["keyword"] or None)
+        for d in docs:
+            key = d.get("link") or d.get("title")
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(d)
+    return candidates[:MAX_CANDIDATES]
+
+
+# ==========================================================================
+#  Step 3 — select top 10 (topic clustering + LLM judgment for diversity)
+# ==========================================================================
+def _sanitize_indices(result, n_candidates, n):
+    idx = []
+    if isinstance(result, list):
+        for v in result:
+            if isinstance(v, int) and 0 <= v < n_candidates and v not in idx:
+                idx.append(v)
+    if len(idx) < n:
+        for i in range(n_candidates):
+            if len(idx) >= n:
+                break
+            if i not in idx:
+                idx.append(i)
+    return idx[:n]
+
+
+def select_top10(candidates, context, n=TOP_N):
+    if len(candidates) <= n:
+        return candidates
+
+    n_clusters = min(5, max(2, len(candidates) // 10))
+    try:
+        nlp.discover_topics(candidates, n_topics=n_clusters, method="kmeans")
+    except Exception:
+        for d in candidates:
+            d.setdefault("topic", -1)
+
+    listing = "\n".join(
+        f"{i}. [cluster {d.get('topic', -1)}] {d['title']} — "
+        f"{d['abstract'][:150]}"
+        for i, d in enumerate(candidates)
+    )
+    user_prompt = (
+        f"Contexto do utilizador: {context['summary']}\n\n"
+        f"Candidatos (numerados, agrupados por cluster de sub-tópico):\n"
+        f"{listing}\n\n"
+        f"Escolhe os {n} mais relevantes E diversos (tenta cobrir vários "
+        "clusters, não só o maior). Responde APENAS com JSON: lista dos "
+        "índices escolhidos, ex: [0, 3, 7, ...]."
+    )
+    result = _chat(
+        system=("És um editor de newsletter que seleciona os melhores "
+               "artigos científicos para um utilizador, equilibrando "
+               "relevância e diversidade de temas."),
+        user=user_prompt, max_new_tokens=100, expect_json=True,
+    )
+    indices = _sanitize_indices(result, len(candidates), n)
+    return [candidates[i] for i in indices]
+
+
+# ==========================================================================
+#  Step 4 — summaries + weekly preview (one batched LLM call)
+# ==========================================================================
+def _sanitize_summaries(result, selected):
+    fallback_preview = ("A seleção desta semana cobre os temas que mais "
+                        "tens pesquisado.")
+    fallback_summaries = [d["abstract"][:180].rsplit(" ", 1)[0] + "…"
+                          for d in selected]
+    if not isinstance(result, dict):
+        return fallback_preview, fallback_summaries
+    preview = result.get("preview") or fallback_preview
+    summaries = result.get("summaries")
+    if not isinstance(summaries, list) or len(summaries) != len(selected):
+        summaries = fallback_summaries
+    else:
+        summaries = [s if isinstance(s, str) and s.strip() else fb
+                     for s, fb in zip(summaries, fallback_summaries)]
+    return preview, summaries
+
+
+def summarize_and_preview(selected, context):
+    listing = "\n".join(
+        f"{i}. {d['title']} — {d['abstract'][:220]}"
+        for i, d in enumerate(selected)
+    )
+    user_prompt = (
+        f"Contexto do utilizador: {context['summary']}\n\n"
+        f"Artigos selecionados:\n{listing}\n\n"
+        "Para cada artigo, escreve um resumo de UMA frase curta em "
+        "português, claro e específico (não repitas o título). Escreve "
+        "também um parágrafo de preview (1-2 frases, português) sobre os "
+        "destaques desta semana. Responde APENAS com JSON: "
+        '{"preview": "...", "summaries": ["...", "...", ...]} '
+        "(summaries na mesma ordem dos artigos)."
+    )
+    result = _chat(
+        system=("És um editor de newsletter científica que escreve resumos "
+               "curtos, claros e fiéis ao conteúdo original, em português "
+               "europeu."),
+        user=user_prompt, max_new_tokens=480, expect_json=True,
+    )
+    return _sanitize_summaries(result, selected)
+
+
+# ==========================================================================
+#  Step 5 — quality-control critique
+# ==========================================================================
+def critique(draft):
+    items = draft["items"]
+    issues = []
+    if len(items) != TOP_N:
+        issues.append(f"esperado {TOP_N} itens, encontrados {len(items)}")
+    titles = [it["title"] for it in items]
+    if len(set(titles)) != len(titles):
+        issues.append("há títulos duplicados")
+    for it in items:
+        summ = (it.get("summary_pt") or "").strip()
+        if len(summ) < 15 or summ.lower() in it["title"].lower():
+            issues.append(f"resumo fraco/repetido para: {it['title'][:60]}")
+
+    if issues:
+        return {"ok": False, "issues": issues}
+
+    listing = "\n".join(f"- {it['title']}: {it['summary_pt']}" for it in items)
+    user_prompt = (
+        f"Preview: {draft['preview']}\n\nItens:\n{listing}\n\n"
+        "Avalia esta newsletter: os itens são relevantes e diversos entre "
+        "si? Os resumos são específicos e úteis? Responde APENAS com JSON: "
+        '{"ok": true|false, "issues": ["..."]}.'
+    )
+    result = _chat(
+        system="És um crítico exigente de newsletters científicas.",
+        user=user_prompt, max_new_tokens=120, expect_json=True,
+    )
+    if isinstance(result, dict) and "ok" in result:
+        return {"ok": bool(result["ok"]), "issues": result.get("issues") or []}
+    # critic itself failed to produce usable JSON — don't block forever
+    return {"ok": True, "issues": []}
+
+
+# ==========================================================================
+#  Orchestrator — cache-aware, with the bounded refine loop
+# ==========================================================================
+def _iso_week_key(d=None):
+    d = d or datetime.date.today()
+    iso = d.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
+def week_range_label(d=None):
+    d = d or datetime.date.today()
+    monday = d - datetime.timedelta(days=d.weekday())
+    sunday = monday + datetime.timedelta(days=6)
+    if monday.month == sunday.month:
+        return f"{monday.day}–{sunday.day} de {MONTHS_PT[monday.month]}"
+    return (f"{monday.day} de {MONTHS_PT[monday.month]} – "
+            f"{sunday.day} de {MONTHS_PT[sunday.month]}")
+
+
+def _build_draft(context, week_key, attempt, progress=None):
+    def step(msg):
+        if progress:
+            progress(msg)
+
+    step("A planear pesquisas no arXiv com base no teu contexto...")
+    queries = plan_queries(context)
+
+    step(f"A procurar candidatos no arXiv ({', '.join(q['category'] for q in queries)})...")
+    candidates = fetch_candidates(queries)
+    if not candidates:
+        queries = [{"category": c, "keyword": ""}
+                  for c in DEFAULT_PROFILE["categories"]]
+        candidates = fetch_candidates(queries)
+
+    step(f"A selecionar os {TOP_N} mais relevantes e diversos "
+        f"({len(candidates)} candidatos)...")
+    selected = select_top10(candidates, context)
+
+    step("A escrever resumos e o preview da semana...")
+    preview, summaries = summarize_and_preview(selected, context)
+    items = [
+        {"title": d["title"], "authors": d["authors"][:4], "summary_pt": s,
+         "arxiv_id": d["link"].rsplit("/", 1)[-1] if d.get("link") else "",
+         "link": d["link"], "pdf_url": d["pdf_url"]}
+        for d, s in zip(selected, summaries)
+    ]
+    return {"week_key": week_key, "week_label": week_range_label(),
+           "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+           "interest_summary": context["summary"], "preview": preview,
+           "items": items, "queries_used": queries,
+           "refine_iterations": attempt}
+
+
+def generate_weekly_newsletter(force=False, progress=None):
+    """progress, if given, is called with a short Portuguese status string
+    before each pipeline stage — lets the UI show real step-by-step
+    feedback instead of an opaque spinner during the (rare) 1-2 min a full
+    generation takes."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    week_key = _iso_week_key()
+    cache_path = CACHE_DIR / f"{week_key}.json"
+    if cache_path.exists() and not force:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+
+    if progress:
+        progress("A compactar o teu contexto de pesquisas...")
+    context = compact_context(load_recent_history())
+
+    draft = None
+    for attempt in range(MAX_REFINE_LOOPS + 1):
+        draft = _build_draft(context, week_key, attempt, progress=progress)
+        if progress:
+            progress("A rever a qualidade da seleção...")
+        result = critique(draft)
+        if result["ok"]:
+            draft["quality_flag"] = None
+            break
+        draft["quality_flag"] = "; ".join(result["issues"]) \
+            or "qualidade não confirmada"
+        if progress and attempt < MAX_REFINE_LOOPS:
+            progress("Qualidade insuficiente — a refinar a seleção...")
+
+    cache_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2),
+                          encoding="utf-8")
+    return draft
+
+
+def peek_current_issue():
+    """Read the current week's cached issue without triggering generation —
+    used by the sidebar so just viewing it never calls the LLM."""
+    cache_path = CACHE_DIR / f"{_iso_week_key()}.json"
+    if not cache_path.exists():
+        return None
+    with open(cache_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def list_past_issues(limit=4):
+    if not CACHE_DIR.exists():
+        return []
+    current = _iso_week_key()
+    files = sorted(CACHE_DIR.glob("*.json"), reverse=True)
+    out = []
+    for fp in files:
+        if fp.stem == current:
+            continue
+        try:
+            with open(fp, encoding="utf-8") as f:
+                out.append(json.load(f))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if len(out) >= limit:
+            break
+    return out

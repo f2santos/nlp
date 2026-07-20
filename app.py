@@ -1,20 +1,21 @@
 """
 app.py
 ------
-Streamlit prototype: "arXiv Trend Radar"
+Streamlit app: "MindFeed" — an end-to-end NLP application over REAL data
+from arXiv.
 
-An end-to-end NLP application over REAL data from arXiv. Two modes:
-
-  • Latest trend  — pick a subject, fetch the latest papers, run the full NLP
-    pipeline (keywords, topic discovery, NER, summary, trend report).
-  • Compare years — fetch several hundred papers per year for a subject and
-    compare the years on a radar/spider chart of NLP-derived metrics
-    (e.g. how Machine Learning looked in 2010 vs 2020).
+The landing page routes to two areas:
+  • Search      — the trend-analysis tool (latest trend + compare years):
+                  keywords, topic discovery, NER, summary, trend report,
+                  radar chart.
+  • Newsletter  — placeholder for a personalised digest (coming soon).
 
 Run locally:   streamlit run app.py
 """
 
 import datetime
+import textwrap
+from collections import Counter
 
 import pandas as pd
 import streamlit as st
@@ -22,21 +23,278 @@ import plotly.graph_objects as pgo
 
 import arxiv_api
 import nlp_pipeline as nlp
+import newsletter_agent as na
 
-st.set_page_config(page_title="arXiv Trend Radar",
-                   page_icon="🛰️", layout="wide")
-
-st.title("🛰️ arXiv Trend Radar")
+st.set_page_config(page_title="MindFeed", page_icon="🧠", layout="wide")
 
 CURRENT_YEAR = datetime.date.today().year
 
+if "page" not in st.session_state:
+    st.session_state.page = "landing"
+
 
 # ==========================================================================
-#  Mode 1 — Latest trend
+#  Global styling & small nav helpers
+# ==========================================================================
+def inject_css():
+    st.markdown(textwrap.dedent("""
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+      html, body, [class*="css"]  { font-family: 'Inter', sans-serif; }
+      h1, h2, h3 { font-family: 'Fraunces', serif !important; color: #241F1A; }
+      footer { visibility: hidden; }
+      div.stButton > button, div.stFormSubmitButton > button {
+        border-radius: 999px !important;
+        font-weight: 600 !important;
+        transition: transform .15s ease, box-shadow .15s ease !important;
+      }
+      div.stButton > button:hover, div.stFormSubmitButton > button:hover {
+        transform: translateY(-1px);
+      }
+      .mf-eyebrow {
+        text-align: center; letter-spacing: .18em; text-transform: uppercase;
+        font-size: .75rem; font-weight: 600; color: #C9673F; margin-bottom: .75rem;
+      }
+      .mf-hero-title {
+        text-align: center; font-family: 'Fraunces', serif; font-weight: 600;
+        font-size: 4.2rem; line-height: 1.05; color: #241F1A; margin: 0;
+      }
+      .mf-hero-title span { color: #C9673F; }
+      .mf-hero-sub {
+        text-align: center; font-size: 1.15rem; color: #6B6259; max-width: 620px;
+        margin: 1.1rem auto 3rem auto; line-height: 1.6;
+      }
+      .mf-card {
+        background: #FFFFFF; border-radius: 20px; padding: 2.1rem 1.9rem 1.4rem;
+        box-shadow: 0 1px 3px rgba(36,31,26,.06), 0 12px 28px rgba(36,31,26,.05);
+        border: 1px solid #F0EAE1; margin-bottom: .9rem;
+        min-height: 300px; display: flex; flex-direction: column;
+        justify-content: flex-start;
+      }
+      .mf-icon {
+        width: 52px; height: 52px; border-radius: 14px; background: #FBEDE4;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 1.5rem; margin-bottom: 1rem;
+      }
+      .mf-card h3 { margin: 0 0 .5rem 0; font-size: 1.35rem; }
+      .mf-card p { color: #6B6259; font-size: .95rem; line-height: 1.55; min-height: 4.6em; }
+      .mf-badge {
+        display: inline-block; font-size: .7rem; font-weight: 600; letter-spacing: .06em;
+        text-transform: uppercase; background: #F0EAE1; color: #8A7F70;
+        padding: .2rem .55rem; border-radius: 999px; margin-bottom: .6rem;
+      }
+      .mf-badge-accent { background: #C9673F; color: #FFFFFF; }
+      .mf-footer { text-align: center; color: #A79C8D; font-size: .82rem; margin-top: 3rem; }
+      .mf-rail-card {
+        background: #FFFFFF; border-radius: 18px; padding: 1.4rem 1.3rem;
+        margin-bottom: 1rem; border: 1px solid #F0EAE1;
+        box-shadow: 0 1px 3px rgba(36,31,26,.05);
+      }
+      .mf-avatar {
+        width: 46px; height: 46px; border-radius: 50%; background: #C9673F;
+        color: #FFFFFF; display: flex; align-items: center; justify-content: center;
+        font-family: 'Fraunces', serif; font-size: 1.2rem; font-weight: 600;
+        margin-bottom: .7rem;
+      }
+      .mf-rail-name { font-family: 'Fraunces', serif; font-size: 1.15rem; font-weight: 600; color: #241F1A; }
+      .mf-rail-role { font-size: .82rem; color: #8A7F70; margin-top: .15rem; }
+      .mf-rail-title { font-weight: 600; color: #241F1A; margin-top: .3rem; }
+      .mf-rail-text { font-size: .85rem; color: #6B6259; line-height: 1.5; margin-top: .4rem; }
+      .mf-feed-hero {
+        background: linear-gradient(135deg, #FFF7F0, #FDECE3); border-radius: 20px;
+        padding: 1.8rem 2rem; border: 1px solid #F3DFCF; margin-bottom: 1.6rem;
+      }
+      .mf-feed-hero h2 { margin: .5rem 0 .6rem 0; font-size: 1.6rem; }
+      .mf-hero-preview { color: #6B6259; font-size: .98rem; line-height: 1.6; margin: 0; }
+    </style>
+    """), unsafe_allow_html=True)
+
+
+def hide_sidebar():
+    st.markdown(
+        "<style>[data-testid='stSidebar']{display:none;}</style>",
+        unsafe_allow_html=True,
+    )
+
+
+def top_nav():
+    if st.button("← MindFeed", type="tertiary", key="top_nav_back"):
+        st.session_state.page = "landing"
+        st.rerun()
+
+
+# ==========================================================================
+#  Landing page
+# ==========================================================================
+def render_landing():
+    hide_sidebar()
+    _, mid, _ = st.columns([1, 3.4, 1])
+    with mid:
+        st.markdown('<div class="mf-eyebrow">Investigação em tempo real · '
+                    'via arXiv</div>', unsafe_allow_html=True)
+        st.markdown('<h1 class="mf-hero-title">Mind<span>Feed</span></h1>',
+                    unsafe_allow_html=True)
+        st.markdown(
+            '<p class="mf-hero-sub">Descobre as tendências de investigação '
+            'mais recentes — resumidas, organizadas por tópicos e à tua '
+            'medida, direto do arXiv.</p>',
+            unsafe_allow_html=True,
+        )
+
+        col1, col2 = st.columns(2, gap="large")
+        with col1:
+            st.markdown(
+                '<div class="mf-card">'
+                '<span class="mf-badge" style="visibility:hidden;">Em breve</span>'
+                '<div class="mf-icon">🔍</div>'
+                '<h3>Explorar tendências</h3>'
+                '<p>Pesquisa em tempo real nas últimas publicações do '
+                'arXiv, com deteção automática de tópicos, entidades e '
+                'resumos gerados por IA.</p>'
+                '</div>', unsafe_allow_html=True,
+            )
+            if st.button("Começar a explorar →", type="primary",
+                         use_container_width=True, key="go_search"):
+                st.session_state.page = "search"
+                st.rerun()
+        with col2:
+            st.markdown(
+                '<div class="mf-card">'
+                '<span class="mf-badge">Em breve</span>'
+                '<div class="mf-icon">✉️</div>'
+                '<h3>Newsletter pessoal</h3>'
+                '<p>Um resumo feito à tua medida, com os temas e categorias '
+                'que mais te interessam, entregue quando quiseres.</p>'
+                '</div>', unsafe_allow_html=True,
+            )
+            if st.button("Configurar preferências →",
+                         use_container_width=True, key="go_newsletter"):
+                st.session_state.page = "newsletter"
+                st.rerun()
+
+        st.markdown(
+            '<div class="mf-footer">Dados reais via arXiv API · '
+            'Modelos open-source, sem custos</div>',
+            unsafe_allow_html=True,
+        )
+
+
+# ==========================================================================
+#  Newsletter — personal dashboard, backed by the newsletter_agent pipeline
+# ==========================================================================
+def render_profile_rail():
+    st.markdown(textwrap.dedent("""
+    <div class="mf-rail-card">
+      <div class="mf-avatar">P</div>
+      <div class="mf-rail-name">Pedro</div>
+      <div class="mf-rail-role">Meta AI Engineer · RAG</div>
+    </div>
+    """), unsafe_allow_html=True)
+
+    history = na.load_recent_history()
+    current = na.peek_current_issue()
+    if history:
+        top_cats = ", ".join(
+            c for c, _ in Counter(
+                h["category"] for h in history if h.get("category")
+            ).most_common(3))
+        stats_line = f"Baseado em {len(history)} pesquisas recentes: {top_cats}."
+    else:
+        stats_line = "Ainda sem pesquisas registadas nesta sessão local."
+    summary_line = (current["interest_summary"] if current else
+                    "Gera a newsletter para veres aqui o teu contexto "
+                    "compactado.")
+
+    st.markdown(textwrap.dedent(f"""
+    <div class="mf-rail-card">
+      <span class="mf-badge">{'Ativo' if history else 'Em construção'}</span>
+      <div class="mf-rail-title">Contexto compactado</div>
+      <p class="mf-rail-text">{stats_line}</p>
+      <p class="mf-rail-text">{summary_line}</p>
+    </div>
+    """), unsafe_allow_html=True)
+
+
+def _generate_with_status(force=False):
+    with st.status("A preparar a tua newsletter (LLM local, pode demorar "
+                   "um pouco)...", expanded=True) as status:
+        issue = na.generate_weekly_newsletter(
+            force=force, progress=lambda msg: status.write(msg))
+        status.update(label="Newsletter pronta ✔", state="complete")
+    return issue
+
+
+def render_newsletter_feed():
+    issue = _generate_with_status()
+
+    st.markdown(textwrap.dedent(f"""
+    <div class="mf-feed-hero">
+      <span class="mf-badge mf-badge-accent">Esta semana · {issue['week_label']}</span>
+      <h2>O que achámos importante para ti</h2>
+      <p class="mf-hero-preview">{issue['preview']}</p>
+    </div>
+    """), unsafe_allow_html=True)
+
+    if issue.get("quality_flag"):
+        st.caption(f"⚠️ Nota de qualidade: {issue['quality_flag']}")
+
+    if st.button("🔄 Gerar novamente esta semana"):
+        _generate_with_status(force=True)
+        st.rerun()
+
+    st.markdown("**🔝 Top 10 para ti**")
+    for i, item in enumerate(issue["items"], start=1):
+        c1, c2 = st.columns([5, 1], vertical_alignment="center")
+        with c1:
+            st.markdown(f"**{i}. {item['title']}**")
+            if item.get("authors"):
+                st.caption(", ".join(item["authors"]))
+            st.caption(item["summary_pt"])
+        with c2:
+            if item.get("pdf_url"):
+                st.link_button("📄 Abrir PDF", item["pdf_url"],
+                               use_container_width=True)
+            else:
+                st.button("📄 Abrir PDF", key=f"pdf_{i}", disabled=True,
+                          use_container_width=True)
+        st.divider()
+
+    st.markdown("**Edições anteriores**")
+    past_issues = na.list_past_issues()
+    if not past_issues:
+        st.caption("Ainda não há edições anteriores — volta na próxima "
+                   "semana.")
+    for past in past_issues:
+        n_items = len(past.get("items", []))
+        with st.expander(f"{past['week_label']} · {n_items} artigos"):
+            st.caption(past.get("preview", ""))
+            for it in past.get("items", []):
+                st.markdown(f"- **{it['title']}** — {it['summary_pt']}")
+
+
+def render_newsletter():
+    hide_sidebar()
+    top_nav()
+    st.title("📰 MindFeed — Newsletter pessoal")
+    st.caption("A tua seleção semanal de investigação em RAG e IA aplicada — "
+              "gerada a partir do que pesquisas em Explorar tendências.")
+
+    main_col, side_col = st.columns([2.6, 1], gap="large")
+    with side_col:
+        render_profile_rail()
+    with main_col:
+        render_newsletter_feed()
+
+
+# ==========================================================================
+#  Search app — Mode 1: Latest trend
 # ==========================================================================
 def render_latest_trend(subject_label, keyword, max_items, n_topics,
                         topic_method, run_llm):
     category = arxiv_api.CATEGORIES[subject_label]
+    na.record_search(subject_label, category, keyword, mode="latest_trend")
 
     with st.status(f"Fetching the latest **{subject_label}** papers from "
                    f"arXiv...", expanded=True) as status:
@@ -161,7 +419,7 @@ def render_latest_trend(subject_label, keyword, max_items, n_topics,
 
 
 # ==========================================================================
-#  Mode 2 — Compare years (radar / spider chart)
+#  Search app — Mode 2: Compare years (radar / spider chart)
 # ==========================================================================
 def _radar_figure(profiles):
     """Build a Plotly radar chart: one filled trace per year, each metric
@@ -189,6 +447,7 @@ def _radar_figure(profiles):
 
 def render_compare_years(subject_label, keyword, years, max_per_year):
     category = arxiv_api.CATEGORIES[subject_label]
+    na.record_search(subject_label, category, keyword, mode="compare_years")
     years = sorted(set(years))
 
     with st.status(f"Fetching **{subject_label}** papers for "
@@ -300,76 +559,92 @@ def render_compare_years(subject_label, keyword, years, max_per_year):
 
 
 # ==========================================================================
-#  Sidebar + dispatch
+#  Search app — sidebar + dispatch
 # ==========================================================================
-with st.sidebar:
-    mode = st.radio("Mode", ["Latest trend", "Compare years"], index=0)
-    st.divider()
+def render_search_app():
+    top_nav()
+    st.title("🔍 MindFeed — Explorar tendências")
+
+    with st.sidebar:
+        mode = st.radio("Mode", ["Latest trend", "Compare years"], index=0)
+        st.divider()
+
+        if mode == "Latest trend":
+            st.header("Latest trend")
+            subject_label = st.selectbox(
+                "Subject (arXiv category)",
+                options=list(arxiv_api.CATEGORIES.keys()), index=0,
+                help="Pick the scientific area whose latest trend to analyse.",
+            )
+            keyword = st.text_input(
+                "Refine by keyword (optional)", value="",
+                help="Narrow the papers, e.g. 'transformer'. Empty = whole category.",
+            )
+            max_items = st.slider("Number of latest papers", 20, 200, 60, step=20)
+            n_topics = st.slider("Number of sub-topics to detect", 3, 8, 5)
+            topic_method_label = st.radio(
+                "Topic discovery method",
+                ["KMeans (fast, light)", "BERTopic (semantic, heavier)"], index=0,
+                help="KMeans is fast and works on small batches. BERTopic uses "
+                     "sentence embeddings and shines with 150+ papers.",
+            )
+            topic_method = "bertopic" if topic_method_label.startswith("BERTopic") \
+                else "kmeans"
+            run_llm = st.checkbox("Generate summary with LLM", value=True)
+            go = st.button("🔍 Analyse trend", type="primary",
+                           use_container_width=True)
+        else:
+            st.header("Compare years")
+            subject_label = st.selectbox(
+                "Subject (arXiv category)",
+                options=list(arxiv_api.CATEGORIES.keys()), index=0,
+                help="The area to compare across years.",
+            )
+            keyword = st.text_input(
+                "Refine by keyword (optional)", value="",
+                help="Optional keyword filter applied to every year.",
+            )
+            years = st.multiselect(
+                "Years to compare (pick 2–5)",
+                options=list(range(CURRENT_YEAR, 1990, -1)),
+                default=[2010, 2020],
+                help="Older years may be sparse or empty if the category didn't "
+                     "exist yet (e.g. cs.LG before ~2007).",
+            )
+            max_per_year = st.slider("Papers per year", 50, 500, 200, step=50)
+            go = st.button("🕸️ Compare", type="primary", use_container_width=True)
 
     if mode == "Latest trend":
-        st.header("Latest trend")
-        subject_label = st.selectbox(
-            "Subject (arXiv category)",
-            options=list(arxiv_api.CATEGORIES.keys()), index=0,
-            help="Pick the scientific area whose latest trend to analyse.",
-        )
-        keyword = st.text_input(
-            "Refine by keyword (optional)", value="",
-            help="Narrow the papers, e.g. 'transformer'. Empty = whole category.",
-        )
-        max_items = st.slider("Number of latest papers", 20, 200, 60, step=20)
-        n_topics = st.slider("Number of sub-topics to detect", 3, 8, 5)
-        topic_method_label = st.radio(
-            "Topic discovery method",
-            ["KMeans (fast, light)", "BERTopic (semantic, heavier)"], index=0,
-            help="KMeans is fast and works on small batches. BERTopic uses "
-                 "sentence embeddings and shines with 150+ papers.",
-        )
-        topic_method = "bertopic" if topic_method_label.startswith("BERTopic") \
-            else "kmeans"
-        run_llm = st.checkbox("Generate summary with LLM", value=True)
-        go = st.button("🔍 Analyse trend", type="primary",
-                       use_container_width=True)
-    else:
-        st.header("Compare years")
-        subject_label = st.selectbox(
-            "Subject (arXiv category)",
-            options=list(arxiv_api.CATEGORIES.keys()), index=0,
-            help="The area to compare across years.",
-        )
-        keyword = st.text_input(
-            "Refine by keyword (optional)", value="",
-            help="Optional keyword filter applied to every year.",
-        )
-        years = st.multiselect(
-            "Years to compare (pick 2–5)",
-            options=list(range(CURRENT_YEAR, 1990, -1)),
-            default=[2010, 2020],
-            help="Older years may be sparse or empty if the category didn't "
-                 "exist yet (e.g. cs.LG before ~2007).",
-        )
-        max_per_year = st.slider("Papers per year", 50, 500, 200, step=50)
-        go = st.button("🕸️ Compare", type="primary", use_container_width=True)
-
-
-if mode == "Latest trend":
-    st.caption("Discover and interpret the latest research trend in a subject, "
-               "from real arXiv data — with a full NLP pipeline.")
-    if go:
-        render_latest_trend(subject_label, keyword, max_items, n_topics,
-                            topic_method, run_llm)
-    else:
-        st.info("👈 Choose a subject and hit **Analyse trend**.")
-else:
-    st.caption("Compare how a subject evolved across years on a radar chart of "
-               "NLP-derived metrics — e.g. Machine Learning in 2010 vs 2020.")
-    if go:
-        if len(years) < 2:
-            st.error("Pick at least two years to compare.")
-        elif len(years) > 5:
-            st.error("Please pick at most five years (each year is a separate "
-                     "paged fetch from arXiv).")
+        st.caption("Discover and interpret the latest research trend in a subject, "
+                   "from real arXiv data — with a full NLP pipeline.")
+        if go:
+            render_latest_trend(subject_label, keyword, max_items, n_topics,
+                                topic_method, run_llm)
         else:
-            render_compare_years(subject_label, keyword, years, max_per_year)
+            st.info("👈 Choose a subject and hit **Analyse trend**.")
     else:
-        st.info("👈 Choose a subject and 2–5 years, then hit **Compare**.")
+        st.caption("Compare how a subject evolved across years on a radar chart of "
+                   "NLP-derived metrics — e.g. Machine Learning in 2010 vs 2020.")
+        if go:
+            if len(years) < 2:
+                st.error("Pick at least two years to compare.")
+            elif len(years) > 5:
+                st.error("Please pick at most five years (each year is a separate "
+                         "paged fetch from arXiv).")
+            else:
+                render_compare_years(subject_label, keyword, years, max_per_year)
+        else:
+            st.info("👈 Choose a subject and 2–5 years, then hit **Compare**.")
+
+
+# ==========================================================================
+#  Page dispatch
+# ==========================================================================
+inject_css()
+
+if st.session_state.page == "landing":
+    render_landing()
+elif st.session_state.page == "newsletter":
+    render_newsletter()
+else:
+    render_search_app()
