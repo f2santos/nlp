@@ -26,10 +26,14 @@ from pathlib import Path
 import arxiv_api
 import nlp_pipeline as nlp
 
-LLM_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+# Fast/light model for validating the workflow end-to-end on CPU. Same
+# family as Qwen2.5-1.5B-Instruct (identical chat template), ~3x smaller —
+# once the pipeline is confirmed working, swap this one constant to scale
+# up to "Qwen/Qwen2.5-1.5B-Instruct" (or larger) for better output quality.
+LLM_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 MAX_REFINE_LOOPS = 1
 TOP_N = 10
-MAX_CANDIDATES = 24  # hard cap on candidates fed to the LLM — keeps prompts
+MAX_CANDIDATES = 16  # hard cap on candidates fed to the LLM — keeps prompts
                      # (and CPU prefill time) bounded regardless of query count
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -215,7 +219,7 @@ def plan_queries(context):
     return _sanitize_queries(result, context)
 
 
-def fetch_candidates(queries, per_query=10):
+def fetch_candidates(queries, per_query=8):
     seen = set()
     candidates = []
     for q in queries:
@@ -261,7 +265,7 @@ def select_top10(candidates, context, n=TOP_N):
 
     listing = "\n".join(
         f"{i}. [cluster {d.get('topic', -1)}] {d['title']} — "
-        f"{d['abstract'][:150]}"
+        f"{d['abstract'][:100]}"
         for i, d in enumerate(candidates)
     )
     user_prompt = (
@@ -304,18 +308,26 @@ def _sanitize_summaries(result, selected):
 
 def summarize_and_preview(selected, context):
     listing = "\n".join(
-        f"{i}. {d['title']} — {d['abstract'][:220]}"
+        f"{i}. {d['title']} — {d['abstract'][:180]}"
         for i, d in enumerate(selected)
     )
     user_prompt = (
         f"Contexto do utilizador: {context['summary']}\n\n"
-        f"Artigos selecionados:\n{listing}\n\n"
+        f"Artigos selecionados ({len(selected)} no total):\n{listing}\n\n"
         "Para cada artigo, escreve um resumo de UMA frase curta em "
         "português, claro e específico (não repitas o título). Escreve "
         "também um parágrafo de preview (1-2 frases, português) sobre os "
-        "destaques desta semana. Responde APENAS com JSON: "
-        '{"preview": "...", "summaries": ["...", "...", ...]} '
-        "(summaries na mesma ordem dos artigos)."
+        "destaques desta semana.\n\n"
+        "Responde APENAS com JSON válido. Exemplo do FORMATO (inventa "
+        "sempre conteúdo novo — nunca copies este exemplo):\n"
+        '{"preview": "Esta semana destacam-se novos métodos de recuperação '
+        'híbrida e agentes para tarefas científicas.", "summaries": '
+        '["Este artigo propõe uma técnica que reduz o custo de indexação '
+        'em bases vetoriais grandes.", "Este trabalho mostra que agentes '
+        'multi-passo superam abordagens de único passo em tarefas '
+        'complexas."]}\n\n'
+        f'A tua lista "summaries" tem de ter exatamente {len(selected)} '
+        "elementos — um por artigo, pela mesma ordem da lista acima."
     )
     result = _chat(
         system=("És um editor de newsletter científica que escreve resumos "
@@ -349,8 +361,10 @@ def critique(draft):
     user_prompt = (
         f"Preview: {draft['preview']}\n\nItens:\n{listing}\n\n"
         "Avalia esta newsletter: os itens são relevantes e diversos entre "
-        "si? Os resumos são específicos e úteis? Responde APENAS com JSON: "
-        '{"ok": true|false, "issues": ["..."]}.'
+        "si? Os resumos são específicos e úteis? Responde APENAS com JSON. "
+        'Se estiver tudo bem: {"ok": true, "issues": []}. Se houver '
+        'problemas, descreve-os: {"ok": false, "issues": ["resumo 3 é '
+        'vago", "item 7 não parece relevante"]}.'
     )
     result = _chat(
         system="És um crítico exigente de newsletters científicas.",
