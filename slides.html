@@ -3,91 +3,84 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>arXiv Trend Radar — Slides</title>
+<title>MindFeed — Slides</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root{
-    --red:#b31b1b;          /* arXiv signature red */
-    --ink:#16181d;
-    --muted:#5c6672;
-    --line:#e4e7ec;
-    --bg:#ffffff;
-    --soft:#f6f7f9;
-    --slide-w:1280px;
-    --slide-h:720px;
+    --accent:#C9673F; --accent-dark:#A84E2C; --accent-soft:#FBEDE4;
+    --ink:#1A1712; --muted:#6B6259; --line:#ECE3D6; --card:#FFFFFF;
+    --slide-w:1280px; --slide-h:720px;
   }
   *{box-sizing:border-box;margin:0;padding:0}
-  html,body{background:#2a2d33;color:var(--ink);
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-    -webkit-font-smoothing:antialiased;line-height:1.5}
+  html,body{background:#2c2a27;
+    font-family:'Inter',-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink);-webkit-font-smoothing:antialiased;line-height:1.5}
+  .serif{font-family:'Fraunces',Georgia,'Times New Roman',serif}
 
-  /* ---- deck / slide layout ---- */
   .deck{display:flex;flex-direction:column;align-items:center;gap:26px;padding:36px 16px 80px}
-  .slide{position:relative;width:var(--slide-w);height:var(--slide-h);background:var(--bg);
+  .slide{position:relative;width:var(--slide-w);height:var(--slide-h);
+    background:linear-gradient(180deg,#FFFDFA 0%,#FBF6EF 100%);
     border-radius:14px;overflow:hidden;box-shadow:0 18px 50px rgba(0,0,0,.35);
-    padding:64px 72px 72px;display:flex;flex-direction:column}
+    padding:60px 70px 70px;display:flex;flex-direction:column}
   .slide::before{content:"";position:absolute;top:0;left:0;height:8px;width:100%;
-    background:linear-gradient(90deg,var(--red),#d94a4a)}
+    background:linear-gradient(90deg,var(--accent),#E08A63)}
 
-  /* kicker + headings */
-  .kicker{display:inline-block;font-size:15px;font-weight:700;letter-spacing:.14em;
-    text-transform:uppercase;color:var(--red);margin-bottom:14px}
-  h1{font-size:60px;line-height:1.05;letter-spacing:-.02em;font-weight:800}
-  h2{font-size:40px;line-height:1.12;letter-spacing:-.02em;font-weight:800;margin-bottom:8px}
-  .sub{font-size:23px;color:var(--muted);font-weight:500}
-  .slide h2 + .sub{margin-top:2px;margin-bottom:26px}
+  .kicker{display:inline-block;font-size:14px;font-weight:700;letter-spacing:.15em;
+    text-transform:uppercase;color:var(--accent);margin-bottom:14px}
+  h1{font-family:'Fraunces',Georgia,serif;font-size:64px;line-height:1.03;
+    letter-spacing:-.02em;font-weight:600;color:var(--ink)}
+  h1 .fx{color:var(--accent)}
+  h2{font-family:'Fraunces',Georgia,serif;font-size:39px;line-height:1.12;
+    letter-spacing:-.01em;font-weight:600;margin-bottom:6px;color:var(--ink)}
+  .sub{font-size:22px;color:var(--muted);font-weight:500}
+  .slide h2 + .sub{margin-top:2px;margin-bottom:24px}
 
-  ul{list-style:none;display:flex;flex-direction:column;gap:16px;margin-top:8px}
-  li{position:relative;padding-left:34px;font-size:24px;color:#242a33}
-  li::before{content:"";position:absolute;left:6px;top:12px;width:10px;height:10px;
-    border-radius:50%;background:var(--red)}
-  li small{display:block;font-size:18px;color:var(--muted);padding-left:0;margin-top:2px}
-  b,strong{color:var(--ink);font-weight:750}
-  .em{color:var(--red);font-weight:750}
+  ul{list-style:none;display:flex;flex-direction:column;gap:15px;margin-top:10px}
+  li{position:relative;padding-left:32px;font-size:23px;color:#2b2b31}
+  li::before{content:"";position:absolute;left:4px;top:11px;width:10px;height:10px;
+    border-radius:50%;background:var(--accent)}
+  b,strong{color:var(--ink);font-weight:700}
+  .em{color:var(--accent);font-weight:700}
 
-  /* pipeline chip row */
-  .flow{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:22px 0 8px}
-  .flow .step{background:var(--soft);border:1px solid var(--line);border-radius:999px;
-    padding:11px 20px;font-size:19px;font-weight:650}
-  .flow .arrow{color:var(--red);font-size:22px;font-weight:800}
+  .flow{display:flex;flex-wrap:wrap;align-items:center;gap:9px;margin:20px 0 6px}
+  .flow .step{background:var(--accent-soft);border:1px solid #F1D9C8;border-radius:999px;
+    padding:10px 18px;font-size:18px;font-weight:650;color:#7a3f26}
+  .flow .arrow{color:var(--accent);font-size:20px;font-weight:800}
 
-  /* two-column */
-  .cols{display:grid;grid-template-columns:1fr 1fr;gap:38px;margin-top:6px}
-  .card{background:var(--soft);border:1px solid var(--line);border-radius:12px;padding:22px 24px}
-  .card h3{font-size:20px;color:var(--red);margin-bottom:12px;letter-spacing:.02em}
-  .card ul{gap:10px}
-  .card li{font-size:20px;padding-left:26px}
-  .card li::before{top:10px;width:8px;height:8px}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:34px;margin-top:6px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 22px;
+    box-shadow:0 2px 10px rgba(36,31,26,.04)}
+  .card h3{font-family:'Fraunces',Georgia,serif;font-size:20px;color:var(--accent);margin-bottom:10px}
+  .card ul{gap:9px}
+  .card li{font-size:19px;padding-left:24px}
+  .card li::before{top:9px;width:8px;height:8px}
 
-  /* footer / page number */
-  .foot{position:absolute;bottom:26px;left:72px;right:72px;display:flex;justify-content:space-between;
-    align-items:center;font-size:15px;color:var(--muted);border-top:1px solid var(--line);padding-top:12px}
-  .foot .brand{font-weight:700;color:#8a929c;letter-spacing:.02em}
+  .foot{position:absolute;bottom:24px;left:70px;right:70px;display:flex;justify-content:space-between;
+    align-items:center;font-size:14px;color:var(--muted);border-top:1px solid var(--line);padding-top:11px}
+  .foot .brand{font-weight:700;color:#9a8f80;letter-spacing:.02em}
   .pageno{font-variant-numeric:tabular-nums}
 
-  /* title slide specifics */
   .title{justify-content:center}
-  .title .meta{margin-top:34px;font-size:22px;color:var(--muted);display:flex;flex-direction:column;gap:8px}
-  .title .links{margin-top:10px;font-size:19px}
+  .title .meta{margin-top:32px;font-size:21px;color:var(--muted);display:flex;flex-direction:column;gap:7px}
+  .title .links{margin-top:8px;font-size:18px}
   .fill{color:#b9772b;background:#fdf3e6;border:1px solid #f0d9b8;border-radius:6px;
     padding:1px 9px;font-weight:650;font-size:.92em}
-
+  .note{font-size:16px;color:var(--muted);margin-top:16px;font-style:italic}
   .spacer{flex:1}
-  .note{font-size:17px;color:var(--muted);margin-top:18px;font-style:italic}
 
-  /* on-screen navigation hint */
   .hint{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:50;
-    background:rgba(20,22,26,.86);color:#fff;font-size:13px;padding:8px 16px;border-radius:999px;
+    background:rgba(26,23,18,.88);color:#fff;font-size:13px;padding:8px 16px;border-radius:999px;
     box-shadow:0 6px 20px rgba(0,0,0,.3)}
-  .hint b{color:#ffb4b4}
+  .hint b{color:#ffbfa3}
 
-  /* ---- on-screen "present" mode: show one slide at a time ---- */
   body.present .deck{padding:0}
   body.present .slide{display:none;position:fixed;top:50%;left:50%;
     transform:translate(-50%,-50%) scale(var(--scale,1));transform-origin:center;
     border-radius:0;box-shadow:none}
   body.present .slide.active{display:flex}
 
-  /* ---- print: one slide per landscape page, clean ---- */
   @media print{
     @page{size:1280px 720px;margin:0}
     html,body{background:#fff}
@@ -105,173 +98,205 @@
   <!-- 1 -->
   <section class="slide title">
     <span class="kicker">Applied Natural Language Processing · Group Project</span>
-    <h1>arXiv Trend Radar</h1>
-    <p class="sub">Discovering and interpreting the latest research trends with NLP</p>
+    <h1 class="serif">Mind<span class="fx">Feed</span></h1>
+    <p class="sub">Real-time research trend intelligence, powered by arXiv</p>
     <div class="meta">
       <span>Group members: <span class="fill">[names]</span></span>
       <span class="links">🔗 Live demo: <span class="fill">[Streamlit Cloud link]</span>
         &nbsp;·&nbsp; 🎥 Video: <span class="fill">[link]</span></span>
     </div>
-    <div class="foot"><span class="brand">arXiv Trend Radar</span><span class="pageno">1</span></div>
+    <div class="foot"><span class="brand">MindFeed</span><span class="pageno">1</span></div>
   </section>
 
   <!-- 2 -->
   <section class="slide">
     <span class="kicker">Problem &amp; context</span>
-    <h2>Staying on top of a fast-moving field is impossible by hand</h2>
+    <h2 class="serif">Keeping up with research doesn't scale</h2>
     <ul>
-      <li>arXiv publishes <b>thousands of papers per week</b>; a single subject (e.g. NLP)
-        gets <b>hundreds of new pre-prints every month</b>.</li>
-      <li>Researchers, R&amp;D teams, analysts and investors need to know <span class="em">what's trending</span>
-        — which methods and sub-topics are heating up — <b>without reading it all</b>.</li>
+      <li>arXiv publishes <b>thousands of papers per week</b>; a single field
+        (e.g. NLP) gets <b>hundreds of new pre-prints every month</b>.</li>
+      <li>Researchers, R&amp;D teams, analysts and newcomers need to know
+        <span class="em">what's trending</span> — and <span class="em">what
+        matters to them</span> — <b>without reading everything</b>.</li>
       <li>Manual literature review is slow, subjective, and always out of date.</li>
     </ul>
-    <p class="note">Business angle: competitive intelligence, R&amp;D prioritisation, keeping a team current.</p>
-    <div class="foot"><span class="brand">arXiv Trend Radar</span><span class="pageno">2</span></div>
+    <p class="note">Business relevance: competitive intelligence, R&amp;D
+      prioritisation, onboarding new team members, staying current.</p>
+    <div class="foot"><span class="brand">MindFeed</span><span class="pageno">2</span></div>
   </section>
 
   <!-- 3 -->
   <section class="slide">
-    <span class="kicker">Why NLP</span>
-    <h2>This is a text-understanding problem at scale</h2>
-    <ul>
-      <li>The signal lives in <b>unstructured text</b> — titles and abstracts.</li>
-      <li>NLP lets us <b>extract, group and summarise</b> that text automatically:
-        keywords, sub-topics, entities, and a readable summary.</li>
-      <li>Turns <span class="em">hundreds of abstracts</span> into <span class="em">one interpretable trend report</span>.</li>
-    </ul>
-    <div class="foot"><span class="brand">arXiv Trend Radar</span><span class="pageno">3</span></div>
+    <span class="kicker">Why NLP · what we built</span>
+    <h2 class="serif">MindFeed — two NLP-powered ways in</h2>
+    <p class="sub">The signal lives in unstructured text (abstracts + your CV) —
+      exactly what NLP can extract, group, summarise and personalise.</p>
+    <div class="cols">
+      <div class="card">
+        <h3>🔍 Explore trends</h3>
+        <ul>
+          <li>Analyse the latest papers in a field.</li>
+          <li>Keywords, topics, entities, AI summary, trend report.</li>
+          <li>Compare a field across years on a radar chart.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>✉️ Personal newsletter</h3>
+        <ul>
+          <li>Upload your CV → we read your interests.</li>
+          <li>A weekly top-10 digest tailored to you.</li>
+          <li>Curated &amp; summarised by a local LLM.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot"><span class="brand">MindFeed</span><span class="pageno">3</span></div>
   </section>
 
   <!-- 4 -->
   <section class="slide">
-    <span class="kicker">Data source</span>
-    <h2>Real data from the arXiv API</h2>
-    <p class="sub">Public, live, no API key</p>
+    <span class="kicker">Data sources</span>
+    <h2 class="serif">Real data, live, no paid keys</h2>
     <ul>
-      <li>Public arXiv Atom API — <b>export.arxiv.org/api/query</b>.</li>
-      <li>Fetches the <b>latest papers</b> in a chosen category, sorted by submission date.</li>
-      <li><b>17 subjects</b> selectable (cs.AI, cs.CL, cs.LG, cs.CV, quant-ph, q-bio, …),
-        with optional keyword refinement.</li>
-      <li>Per paper: title, abstract, authors, date, categories, links.</li>
+      <li><b>arXiv API</b> — the latest papers by submission date across
+        <b>17 subjects</b>, with keyword refinement and a date-range filter for
+        year-over-year comparison. Fetched live at run time.</li>
+      <li><b>User CV</b> (PDF or text) — a second real document source, parsed
+        with <b>pypdf</b> to extract the person's name and research interests.</li>
     </ul>
-    <div class="foot"><span class="brand">arXiv Trend Radar</span><span class="pageno">4</span></div>
+    <p class="note">No API key required for either source.</p>
+    <div class="foot"><span class="brand">MindFeed</span><span class="pageno">4</span></div>
   </section>
 
   <!-- 5 -->
   <section class="slide">
     <span class="kicker">Pipeline overview</span>
-    <h2>A simple, complete, interpretable pipeline</h2>
+    <h2 class="serif">A simple, complete, interpretable pipeline</h2>
     <div class="flow">
-      <span class="step">arXiv API</span><span class="arrow">→</span>
+      <span class="step">arXiv API / CV</span><span class="arrow">→</span>
       <span class="step">clean</span><span class="arrow">→</span>
       <span class="step">keywords</span><span class="arrow">→</span>
       <span class="step">topic discovery</span><span class="arrow">→</span>
-      <span class="step">NER</span><span class="arrow">→</span>
-      <span class="step">summary</span><span class="arrow">→</span>
-      <span class="step">report</span>
+      <span class="step">entities</span><span class="arrow">→</span>
+      <span class="step">summarisation</span><span class="arrow">→</span>
+      <span class="step">report / digest</span>
     </div>
     <ul>
       <li>Each stage is <b>small and explainable</b>.</li>
-      <li>Heavy models are cached; everything runs on <b>free, open tools</b>.</li>
+      <li>Everything runs on <b>free, open, local models</b> — no paid API keys.</li>
     </ul>
     <p class="note">"Simplicity over complexity — a well-executed simple pipeline."</p>
-    <div class="foot"><span class="brand">arXiv Trend Radar</span><span class="pageno">5</span></div>
+    <div class="foot"><span class="brand">MindFeed</span><span class="pageno">5</span></div>
   </section>
 
   <!-- 6 -->
   <section class="slide">
-    <span class="kicker">Methods</span>
-    <h2>Standard NLP techniques, correctly applied</h2>
+    <span class="kicker">Methods used</span>
+    <h2 class="serif">Standard NLP techniques, correctly applied</h2>
     <div class="cols">
       <div class="card">
         <h3>Keyword extraction</h3>
         <ul><li>TF-IDF (unigrams + bigrams) → the trending vocabulary.</li></ul>
       </div>
       <div class="card">
-        <h3>Topic discovery</h3>
-        <ul><li>TF-IDF + <b>KMeans</b> clustering → sub-topics (unsupervised text classification).</li></ul>
+        <h3>Topic discovery <span style="font-weight:400;color:var(--muted)">(text classification)</span></h3>
+        <ul><li><b>KMeans</b> + <b>BERTopic</b> (selectable) → sub-topics; CV
+          interests mapped to arXiv categories.</li></ul>
       </div>
       <div class="card">
-        <h3>Named-entity recognition</h3>
-        <ul><li>spaCy → organisations, people, places, systems.</li></ul>
+        <h3>Entity extraction</h3>
+        <ul><li>Rule-based method/model acronyms + <b>spaCy NER</b> for named
+          concepts.</li></ul>
       </div>
       <div class="card">
-        <h3>Preprocessing</h3>
-        <ul><li>Cleaning + domain stopwords to remove academic boilerplate.</li></ul>
+        <h3>Summarisation</h3>
+        <ul><li><b>distilBART</b> (Hugging Face) → automatic trend overview.</li></ul>
       </div>
     </div>
-    <p class="note">We deliberately replaced <b>sentiment</b> with <b>topic discovery</b> — sentiment is
-      meaningless for research abstracts; sub-topics are what trend analysis needs.</p>
-    <div class="foot"><span class="brand">arXiv Trend Radar</span><span class="pageno">6</span></div>
+    <p class="note">We deliberately replaced <b>sentiment</b> (meaningless for
+      research abstracts) with <b>topic discovery</b> — what trend analysis
+      actually needs.</p>
+    <div class="foot"><span class="brand">MindFeed</span><span class="pageno">6</span></div>
   </section>
 
   <!-- 7 -->
   <section class="slide">
     <span class="kicker">Optional LLM component</span>
-    <h2>Automatic summary with a local language model</h2>
+    <h2 class="serif">The personal newsletter: an agentic pipeline</h2>
+    <p class="sub">A local instruction-tuned LLM (Qwen2.5-Instruct) — no API key.</p>
+    <div class="flow">
+      <span class="step">CV → name + interests</span><span class="arrow">→</span>
+      <span class="step">plan queries</span><span class="arrow">→</span>
+      <span class="step">fetch</span><span class="arrow">→</span>
+      <span class="step">cluster + select top 10</span><span class="arrow">→</span>
+      <span class="step">summaries + preview</span><span class="arrow">→</span>
+      <span class="step">quality-control critique</span>
+    </div>
     <ul>
-      <li><b>distilBART</b> (Hugging Face) summarises the latest abstracts into a short
-        "what the field is working on" paragraph.</li>
-      <li>Runs <b>locally, no API key, free to deploy</b>.</li>
-      <li><span class="em">Complements</span> the pipeline — it does not replace it.</li>
+      <li>Interests → short arXiv search keywords + categories.</li>
+      <li>A bounded <b>self-correction loop</b> retries if quality checks fail;
+        results are <b>cached weekly</b>.</li>
     </ul>
-    <div class="foot"><span class="brand">arXiv Trend Radar</span><span class="pageno">7</span></div>
+    <p class="note">Complements — does not replace — the deterministic pipeline.</p>
+    <div class="foot"><span class="brand">MindFeed</span><span class="pageno">7</span></div>
   </section>
 
   <!-- 8 -->
   <section class="slide">
     <span class="kicker">Key results &amp; interpretation</span>
-    <h2>Example: Computation &amp; Language (cs.CL), latest 60 papers</h2>
+    <h2 class="serif">Turning hundreds of abstracts into insight</h2>
     <ul>
-      <li>Top terms: <span class="em">reasoning, language, ai, multimodal, agents</span> → the current focus.</li>
-      <li>Sub-topics (KMeans): <b>"ai · benchmark · agent"</b> (largest), <b>"reasoning · distillation"</b>,
-        <b>"multimodal"</b> …</li>
-      <li>Summary paragraph gives a one-glance overview of the batch.</li>
-      <li><b>Interpretation:</b> the field is centred on LLM <span class="em">reasoning</span>,
-        <span class="em">agents</span> and <span class="em">multimodal</span> work — visible without
-        reading a single paper.</li>
+      <li><b>Term evolution (cs.CL):</b> <span class="em">"llm" 0% → 0% → ~50%"</span>
+        of papers (2013→2018→2023), <b>"word" 42% → 8%</b>, "neural" peaking in
+        2018 — the LLM era, visible in one chart.</li>
+      <li><b>Radar comparison (cs.LG, 1998 vs 2023):</b> authors/paper
+        <b>2.3 → 5.0</b>, methods/paper <b>2.6 → 7.4</b> — the field maturing:
+        more collaborative and method-dense.</li>
+      <li><b>Personalised digest:</b> a top-10 curated from a real CV's
+        interests, each with a one-line summary.</li>
     </ul>
-    <p class="note">▶ Replace this slide's body with a screenshot of the <b>Trend report</b> + <b>Sub-topics</b> tabs.</p>
-    <div class="foot"><span class="brand">arXiv Trend Radar</span><span class="pageno">8</span></div>
+    <p class="note">▶ Replace this slide's body with screenshots of the Term
+      evolution chart + the newsletter feed.</p>
+    <div class="foot"><span class="brand">MindFeed</span><span class="pageno">8</span></div>
   </section>
 
   <!-- 9 -->
   <section class="slide">
     <span class="kicker">Limitations &amp; improvements</span>
-    <h2>Honest about scope</h2>
+    <h2 class="serif">Honest about scope</h2>
     <div class="cols">
       <div class="card">
         <h3>Limitations</h3>
         <ul>
-          <li>General-purpose NER (misses scientific entities).</li>
-          <li>Abstracts only — no full text.</li>
-          <li>KMeans needs a chosen <i>k</i>; English-only summariser.</li>
+          <li>General-purpose NER misses scientific entities; abstracts only.</li>
+          <li>Small local LLM (0.5B) — occasional weak JSON / summaries.</li>
+          <li>arXiv rate limits; KMeans needs <i>k</i>; BERTopic needs many papers.</li>
         </ul>
       </div>
       <div class="card">
         <h3>Improvements</h3>
         <ul>
-          <li>Scientific NER (SciSpaCy); topic modelling (BERTopic/LDA).</li>
-          <li>Trend-over-time across months; citation signals.</li>
-          <li>Optional LLM-API report for richer interpretation.</li>
+          <li>Scientific NER (SciSpaCy / SciERC); larger LLM (Qwen 1.5B+).</li>
+          <li>Trend-over-time; citation signals; email delivery.</li>
+          <li>Cloud deploy with cached models.</li>
         </ul>
       </div>
     </div>
-    <div class="foot"><span class="brand">arXiv Trend Radar</span><span class="pageno">9</span></div>
+    <div class="foot"><span class="brand">MindFeed</span><span class="pageno">9</span></div>
   </section>
 
   <!-- 10 -->
   <section class="slide title">
     <span class="kicker">Prototype &amp; closing</span>
-    <h2>A working demo turning live arXiv data into insight</h2>
+    <h2 class="serif">A working demo over real, live arXiv data</h2>
     <div class="meta">
       <span>🔗 <b>Live app:</b> <span class="fill">[Streamlit Cloud link]</span></span>
       <span>🎥 <b>Video:</b> <span class="fill">[link]</span></span>
-      <span style="margin-top:12px">Stack: Python · Streamlit · scikit-learn · spaCy · Hugging Face</span>
-      <span class="em" style="font-size:24px;margin-top:8px">Simple, complete, and applied to real data.</span>
+      <span style="margin-top:10px">Stack: Python · Streamlit · scikit-learn ·
+        spaCy · Hugging Face (distilBART, Qwen2.5) · BERTopic · Plotly</span>
+      <span class="em serif" style="font-size:23px;margin-top:8px">All local &amp;
+        open — no paid API keys.</span>
     </div>
-    <div class="foot"><span class="brand">arXiv Trend Radar</span><span class="pageno">10</span></div>
+    <div class="foot"><span class="brand">MindFeed</span><span class="pageno">10</span></div>
   </section>
 
 </div>
@@ -283,7 +308,7 @@
 <script>
   const body=document.body, slides=[...document.querySelectorAll('.slide')];
   let i=0;
-  function fit(){ // scale a 1280x720 slide to fit the viewport in present mode
+  function fit(){
     const s=Math.min(window.innerWidth/1280, window.innerHeight/720);
     document.documentElement.style.setProperty('--scale', s.toFixed(4));
   }
