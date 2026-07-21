@@ -39,6 +39,7 @@ MAX_CANDIDATES = 16  # hard cap on candidates fed to the LLM — keeps prompts
 DATA_DIR = Path(__file__).parent / "data"
 HISTORY_PATH = DATA_DIR / "search_history.jsonl"
 CACHE_DIR = DATA_DIR / "newsletter_cache"
+PROFILES_DIR = DATA_DIR / "profiles"  # one JSON file per person (by CV name)
 
 MONTHS_PT = ["", "janeiro", "fevereiro", "março", "abril", "maio", "junho",
              "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
@@ -109,16 +110,20 @@ def _chat(system, user, max_new_tokens=300, expect_json=False):
 # ==========================================================================
 #  Search history — what feeds the compacted context
 # ==========================================================================
-def record_search(subject_label, category, keyword, mode):
+def record_search(subject_label, category, keyword, mode, profile_slug=None):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     entry = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
              "mode": mode, "subject_label": subject_label,
-             "category": category, "keyword": keyword or ""}
+             "category": category, "keyword": keyword or "",
+             "profile_slug": profile_slug or ""}
     with open(HISTORY_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def load_recent_history(days=30):
+def load_recent_history(days=30, profile_slug=None):
+    """If profile_slug is given, only entries recorded under that profile
+    are returned; otherwise all recent entries are returned (this is also
+    the behaviour when no profile has ever been created)."""
     if not HISTORY_PATH.exists():
         return []
     cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
@@ -133,42 +138,167 @@ def load_recent_history(days=30):
                 ts = datetime.datetime.fromisoformat(entry["ts"])
             except (json.JSONDecodeError, KeyError, ValueError):
                 continue
-            if ts >= cutoff:
-                out.append(entry)
+            if ts < cutoff:
+                continue
+            if profile_slug and entry.get("profile_slug") != profile_slug:
+                continue
+            out.append(entry)
     return out
+
+
+# ==========================================================================
+#  Profile — who the newsletter is for (extracted from an uploaded CV)
+# ==========================================================================
+def extract_text_from_pdf(file_bytes):
+    from pypdf import PdfReader
+    import io
+    reader = PdfReader(io.BytesIO(file_bytes))
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def _sanitize_cv_profile(result):
+    if not isinstance(result, dict):
+        return None
+    name = (result.get("name") or "").strip()
+    summary = (result.get("summary") or "").strip()
+    if not name or not summary:
+        return None
+
+    valid_categories = set(arxiv_api.CATEGORIES.values())
+    categories = [c for c in (result.get("categories") or [])
+                 if c in valid_categories][:3] or DEFAULT_PROFILE["categories"]
+    keywords = [k for k in (result.get("keywords") or [])
+               if isinstance(k, str) and k.strip()][:3] or \
+        DEFAULT_PROFILE["keywords"]
+    return {"name": name, "summary": summary, "categories": categories,
+           "keywords": keywords}
+
+
+def analyze_cv(pdf_bytes):
+    """Extract a name + interest profile from an uploaded CV PDF via the
+    local LLM. Returns None if the PDF has no usable text or the model's
+    output can't be sanitized into a usable profile — callers should show
+    an error rather than silently falling back, since this is a direct,
+    explicit user action."""
+    text = extract_text_from_pdf(pdf_bytes).strip()
+    if len(text) < 50:
+        return None
+
+    valid_categories = ", ".join(sorted(set(arxiv_api.CATEGORIES.values())))
+    user_prompt = (
+        f"Currículo (texto extraído de PDF):\n{text[:6000]}\n\n"
+        "A partir deste currículo, identifica:\n"
+        "1. O nome completo da pessoa.\n"
+        "2. Um resumo curto (1-2 frases, português) das áreas de "
+        "investigação/trabalho que parecem ser do interesse desta pessoa, "
+        "com base na experiência, competências e projetos descritos.\n"
+        "3. Até 3 categorias arXiv relevantes, escolhidas APENAS desta "
+        f"lista: {valid_categories}\n"
+        "4. Até 3 palavras-chave em inglês para pesquisar artigos "
+        "científicos sobre a área desta pessoa.\n\n"
+        "Responde APENAS com JSON válido. Exemplo do FORMATO (inventa "
+        "sempre conteúdo novo, a partir do currículo acima — nunca copies "
+        "este exemplo):\n"
+        '{"name": "Maria Silva", "summary": "Trabalha em visão '
+        'computacional aplicada a robótica, com foco recente em modelos '
+        'de deteção de objetos em tempo real.", "categories": ["cs.CV", '
+        '"cs.RO"], "keywords": ["object detection", "robotics"]}'
+    )
+    result = _chat(
+        system=("Extrais informação estruturada de currículos para "
+               "personalizar recomendações de artigos científicos."),
+        user=user_prompt, max_new_tokens=250, expect_json=True,
+    )
+    return _sanitize_cv_profile(result)
+
+
+def _slugify(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    return slug or "utilizador"
+
+
+def save_profile(profile):
+    """Saves one JSON file per person (keyed by their CV name), so multiple
+    people can each have their own profile on the same local install.
+    Returns the slug, which callers use to mark this profile as active."""
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    slug = _slugify(profile["name"])
+    profile = {**profile, "slug": slug}
+    (PROFILES_DIR / f"{slug}.json").write_text(
+        json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+    return slug
+
+
+def list_profiles():
+    """All saved profiles, most recently updated first."""
+    if not PROFILES_DIR.exists():
+        return []
+    files = sorted(PROFILES_DIR.glob("*.json"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    out = []
+    for fp in files:
+        try:
+            out.append(json.loads(fp.read_text(encoding="utf-8")))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def load_profile(slug=None):
+    """The profile matching slug, or the most recently updated one if slug
+    is None/not found, or None if no profile has been created yet."""
+    profiles = list_profiles()
+    if not profiles:
+        return None
+    if slug:
+        for p in profiles:
+            if p.get("slug") == slug:
+                return p
+    return profiles[0]
 
 
 # ==========================================================================
 #  Step 1 — compact context
 # ==========================================================================
-def compact_context(history):
+def compact_context(history, profile_slug=None):
+    profile = load_profile(profile_slug)
+
     if not history:
+        if profile:
+            return {"summary": profile["summary"],
+                   "top_categories": profile["categories"],
+                   "top_keywords": profile["keywords"], "n_searches": 0}
         return {
-            "summary": ("Ainda sem pesquisas registadas — a mostrar "
+            "summary": ("Ainda sem pesquisas nem CV carregado — a mostrar "
                         "sugestões iniciais alinhadas com RAG e IA aplicada."),
             "top_categories": DEFAULT_PROFILE["categories"],
             "top_keywords": DEFAULT_PROFILE["keywords"],
             "n_searches": 0,
         }
 
+    base_categories = profile["categories"] if profile \
+        else DEFAULT_PROFILE["categories"]
+    base_keywords = profile["keywords"] if profile else []
     cat_counts = Counter(h["category"] for h in history if h.get("category"))
     kw_counts = Counter(h["keyword"] for h in history if h.get("keyword"))
-    top_categories = [c for c, _ in cat_counts.most_common(3)] \
-        or DEFAULT_PROFILE["categories"]
-    top_keywords = [k for k, _ in kw_counts.most_common(3)]
+    top_categories = [c for c, _ in cat_counts.most_common(3)] or base_categories
+    top_keywords = [k for k, _ in kw_counts.most_common(3)] or base_keywords
 
     stats_text = (f"{len(history)} pesquisas recentes. Categorias mais "
                  f"pesquisadas: {', '.join(top_categories)}."
                  + (f" Palavras-chave: {', '.join(top_keywords)}."
                     if top_keywords else ""))
+    if profile:
+        stats_text += f" Perfil profissional (do CV): {profile['summary']}"
 
     summary = _chat(
         system=("És um assistente que resume interesses de investigação em "
                "português europeu, em 1-2 frases curtas e naturais, sem "
                "introduções como 'Aqui está'."),
-        user=f"Estatísticas de pesquisa de um utilizador:\n{stats_text}\n\n"
+        user=f"Estatísticas de um utilizador:\n{stats_text}\n\n"
             "Escreve um resumo curto (1-2 frases) do que este utilizador "
-            "parece estar a investigar ultimamente.",
+            "parece estar a investigar ultimamente, combinando o perfil "
+            "profissional com as pesquisas recentes (quando ambos existirem).",
         max_new_tokens=100,
     )
     return {"summary": (summary or "").strip() or stats_text,
@@ -429,20 +559,28 @@ def _build_draft(context, week_key, attempt, progress=None):
            "refine_iterations": attempt}
 
 
-def generate_weekly_newsletter(force=False, progress=None):
+def _cache_dir_for(profile_slug):
+    """Cache lives in a per-profile subdirectory (not a filename prefix) so
+    similar slugs — e.g. 'ana' vs 'ana-silva' — can never collide."""
+    return CACHE_DIR / (profile_slug or "default")
+
+
+def generate_weekly_newsletter(force=False, progress=None, profile_slug=None):
     """progress, if given, is called with a short Portuguese status string
     before each pipeline stage — lets the UI show real step-by-step
     feedback instead of an opaque spinner during the (rare) 1-2 min a full
     generation takes."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     week_key = _iso_week_key()
-    cache_path = CACHE_DIR / f"{week_key}.json"
+    cache_dir = _cache_dir_for(profile_slug)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{week_key}.json"
     if cache_path.exists() and not force:
         return json.loads(cache_path.read_text(encoding="utf-8"))
 
     if progress:
         progress("A compactar o teu contexto de pesquisas...")
-    context = compact_context(load_recent_history())
+    history = load_recent_history(profile_slug=profile_slug)
+    context = compact_context(history, profile_slug=profile_slug)
 
     draft = None
     for attempt in range(MAX_REFINE_LOOPS + 1):
@@ -458,33 +596,33 @@ def generate_weekly_newsletter(force=False, progress=None):
         if progress and attempt < MAX_REFINE_LOOPS:
             progress("Qualidade insuficiente — a refinar a seleção...")
 
+    draft["profile_slug"] = profile_slug or ""
     cache_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2),
                           encoding="utf-8")
     return draft
 
 
-def peek_current_issue():
+def peek_current_issue(profile_slug=None):
     """Read the current week's cached issue without triggering generation —
     used by the sidebar so just viewing it never calls the LLM."""
-    cache_path = CACHE_DIR / f"{_iso_week_key()}.json"
+    cache_path = _cache_dir_for(profile_slug) / f"{_iso_week_key()}.json"
     if not cache_path.exists():
         return None
-    with open(cache_path, encoding="utf-8") as f:
-        return json.load(f)
+    return json.loads(cache_path.read_text(encoding="utf-8"))
 
 
-def list_past_issues(limit=4):
-    if not CACHE_DIR.exists():
+def list_past_issues(profile_slug=None, limit=4):
+    cache_dir = _cache_dir_for(profile_slug)
+    if not cache_dir.exists():
         return []
     current = _iso_week_key()
-    files = sorted(CACHE_DIR.glob("*.json"), reverse=True)
+    files = sorted(cache_dir.glob("*.json"), reverse=True)
     out = []
     for fp in files:
         if fp.stem == current:
             continue
         try:
-            with open(fp, encoding="utf-8") as f:
-                out.append(json.load(f))
+            out.append(json.loads(fp.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError):
             continue
         if len(out) >= limit:

@@ -31,6 +31,8 @@ CURRENT_YEAR = datetime.date.today().year
 
 if "page" not in st.session_state:
     st.session_state.page = "landing"
+if "active_profile_slug" not in st.session_state:
+    st.session_state.active_profile_slug = None
 
 
 # ==========================================================================
@@ -185,31 +187,87 @@ def render_landing():
 #  Newsletter — personal dashboard, backed by the newsletter_agent pipeline
 # ==========================================================================
 def render_profile_rail():
-    st.markdown(textwrap.dedent("""
-    <div class="mf-rail-card">
-      <div class="mf-avatar">P</div>
-      <div class="mf-rail-name">Pedro</div>
-      <div class="mf-rail-role">Meta AI Engineer · RAG</div>
-    </div>
-    """), unsafe_allow_html=True)
+    profiles = na.list_profiles()
+    slugs = [p["slug"] for p in profiles]
+    if profiles and st.session_state.active_profile_slug not in slugs:
+        st.session_state.active_profile_slug = slugs[0]
 
-    history = na.load_recent_history()
-    current = na.peek_current_issue()
+    if len(profiles) > 1:
+        names = [p["name"] for p in profiles]
+        current_idx = slugs.index(st.session_state.active_profile_slug)
+        chosen = st.selectbox("Perfil ativo", names, index=current_idx,
+                              key="profile_picker")
+        st.session_state.active_profile_slug = slugs[names.index(chosen)]
+
+    active_slug = st.session_state.active_profile_slug
+    profile = na.load_profile(active_slug)
+
+    if profile:
+        initial = (profile["name"].strip()[:1] or "?").upper()
+        role_line = ", ".join(profile["categories"]) or "Perfil personalizado"
+        st.markdown(textwrap.dedent(f"""
+        <div class="mf-rail-card">
+          <div class="mf-avatar">{initial}</div>
+          <div class="mf-rail-name">{profile['name']}</div>
+          <div class="mf-rail-role">{role_line}</div>
+        </div>
+        """), unsafe_allow_html=True)
+    else:
+        st.markdown(textwrap.dedent("""
+        <div class="mf-rail-card">
+          <div class="mf-avatar">?</div>
+          <div class="mf-rail-name">Sem perfil</div>
+          <div class="mf-rail-role">Carrega o teu CV abaixo</div>
+        </div>
+        """), unsafe_allow_html=True)
+
+    if "cv_expander_open" not in st.session_state:
+        st.session_state.cv_expander_open = False
+
+    with st.expander("📄 Atualizar CV" if profile else "📄 Carregar CV",
+                     expanded=st.session_state.cv_expander_open):
+        uploaded = st.file_uploader(
+            "Currículo (PDF)", type=["pdf"], key="cv_upload",
+            help="O nome e as áreas de interesse são extraídos localmente "
+                 "(LLM local) — o PDF em si não é guardado.")
+        if uploaded is not None:
+            # Keep the expander open across the rerun the uploader itself
+            # triggers — otherwise it snaps shut right as the user needs to
+            # click "Analisar CV".
+            st.session_state.cv_expander_open = True
+        if uploaded is not None and st.button(
+                "Analisar CV", key="analyze_cv_btn", use_container_width=True):
+            with st.spinner("A ler o currículo (LLM local)..."):
+                new_profile = na.analyze_cv(uploaded.read())
+            if new_profile:
+                new_slug = na.save_profile(new_profile)
+                st.session_state.active_profile_slug = new_slug
+                st.success(f"Perfil atualizado: {new_profile['name']}")
+                st.rerun()
+            else:
+                st.error("Não consegui extrair informação útil deste PDF "
+                         "(pode ser uma imagem sem texto). Tenta outro "
+                         "ficheiro.")
+
+    history = na.load_recent_history(profile_slug=active_slug)
+    current = na.peek_current_issue(profile_slug=active_slug)
     if history:
         top_cats = ", ".join(
             c for c, _ in Counter(
                 h["category"] for h in history if h.get("category")
             ).most_common(3))
         stats_line = f"Baseado em {len(history)} pesquisas recentes: {top_cats}."
+    elif profile:
+        stats_line = "Ainda sem pesquisas nesta sessão — a usar o perfil do CV."
     else:
-        stats_line = "Ainda sem pesquisas registadas nesta sessão local."
+        stats_line = "Ainda sem pesquisas nem CV carregado."
     summary_line = (current["interest_summary"] if current else
                     "Gera a newsletter para veres aqui o teu contexto "
                     "compactado.")
 
     st.markdown(textwrap.dedent(f"""
     <div class="mf-rail-card">
-      <span class="mf-badge">{'Ativo' if history else 'Em construção'}</span>
+      <span class="mf-badge">{'Ativo' if (history or profile) else 'Em construção'}</span>
       <div class="mf-rail-title">Contexto compactado</div>
       <p class="mf-rail-text">{stats_line}</p>
       <p class="mf-rail-text">{summary_line}</p>
@@ -221,7 +279,8 @@ def _generate_with_status(force=False):
     with st.status("A preparar a tua newsletter (LLM local, pode demorar "
                    "um pouco)...", expanded=True) as status:
         issue = na.generate_weekly_newsletter(
-            force=force, progress=lambda msg: status.write(msg))
+            force=force, progress=lambda msg: status.write(msg),
+            profile_slug=st.session_state.active_profile_slug)
         status.update(label="Newsletter pronta ✔", state="complete")
     return issue
 
@@ -262,7 +321,8 @@ def render_newsletter_feed():
         st.divider()
 
     st.markdown("**Edições anteriores**")
-    past_issues = na.list_past_issues()
+    past_issues = na.list_past_issues(
+        profile_slug=st.session_state.active_profile_slug)
     if not past_issues:
         st.caption("Ainda não há edições anteriores — volta na próxima "
                    "semana.")
@@ -294,7 +354,8 @@ def render_newsletter():
 def render_latest_trend(subject_label, keyword, max_items, n_topics,
                         topic_method, run_llm):
     category = arxiv_api.CATEGORIES[subject_label]
-    na.record_search(subject_label, category, keyword, mode="latest_trend")
+    na.record_search(subject_label, category, keyword, mode="latest_trend",
+                     profile_slug=st.session_state.active_profile_slug)
 
     with st.status(f"Fetching the latest **{subject_label}** papers from "
                    f"arXiv...", expanded=True) as status:
@@ -447,7 +508,8 @@ def _radar_figure(profiles):
 
 def render_compare_years(subject_label, keyword, years, max_per_year):
     category = arxiv_api.CATEGORIES[subject_label]
-    na.record_search(subject_label, category, keyword, mode="compare_years")
+    na.record_search(subject_label, category, keyword, mode="compare_years",
+                     profile_slug=st.session_state.active_profile_slug)
     years = sorted(set(years))
 
     with st.status(f"Fetching **{subject_label}** papers for "

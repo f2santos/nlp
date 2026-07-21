@@ -47,8 +47,14 @@ A second area ("MindFeed" landing page → *Newsletter pessoal*) turns what you
 search in *Explorar tendências* into a personalised weekly digest, generated
 by a small **agentic pipeline** (`newsletter_agent.py`):
 
-1. **Compact context** — aggregates your recent searches (categories/keywords)
-   into a short interest profile.
+0. **Profile (optional)** — upload a CV (PDF) in the sidebar; the local LLM
+   extracts your name and a short interest summary/categories/keywords
+   (`analyze_cv`, `data/profile.json` — not committed). This seeds the
+   context below even before you've searched anything, and isn't tied to
+   any one person — whoever uploads a CV on this machine becomes "the
+   profile". Only the derived profile is stored; the PDF itself is not.
+1. **Compact context** — combines the CV profile (if any) with your recent
+   searches (categories/keywords) into a short interest profile.
 2. **Plan queries** — the local LLM decides 1–3 arXiv searches to run for
    that profile.
 3. **Fetch candidates** — via the same `arxiv_api.collect_papers` used by the
@@ -108,7 +114,7 @@ streamlit run app.py
 | `nlp_pipeline.py`     | NLP pipeline (keywords, topics, NER, summary, report) |
 | `newsletter_agent.py` | Agentic pipeline behind the personal newsletter (local LLM: context → query planning → selection → summaries → quality-control loop) |
 | `requirements.txt`    | Dependencies                                         |
-| `data/`               | Local runtime state: search history + weekly newsletter cache. **Not committed** (see `.gitignore`) — it's personal, regenerable, and shouldn't be shared between users. |
+| `data/`               | Local runtime state: search history, CV-derived profile, weekly newsletter cache. **Not committed** (see `.gitignore`) — it's personal, regenerable, and shouldn't be shared between users. |
 
 ## Notes
 
