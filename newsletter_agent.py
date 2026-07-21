@@ -2,7 +2,7 @@
 newsletter_agent.py
 --------------------
 Agentic pipeline behind the "Newsletter pessoal" page: turns what the user
-searches in "Explorar tendências" into a personalised weekly digest, using a
+searches in "Explore trends" into a personalised weekly digest, using a
 local instruction-tuned LLM (no paid API key — same "open models only"
 principle as the distilBART summariser in nlp_pipeline.py).
 
@@ -20,6 +20,7 @@ import datetime
 import functools
 import json
 import re
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -39,17 +40,26 @@ MAX_CANDIDATES = 16  # hard cap on candidates fed to the LLM — keeps prompts
 DATA_DIR = Path(__file__).parent / "data"
 HISTORY_PATH = DATA_DIR / "search_history.jsonl"
 CACHE_DIR = DATA_DIR / "newsletter_cache"
-PROFILES_DIR = DATA_DIR / "profiles"  # one JSON file per person (by CV name)
 
-MONTHS_PT = ["", "janeiro", "fevereiro", "março", "abril", "maio", "junho",
-             "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
+MONTHS = ["", "January", "February", "March", "April", "May", "June",
+          "July", "August", "September", "October", "November", "December"]
 
-# Bootstrap profile used only when there is no search history yet, so the
+# Bootstrap profile used only when there is no search history / CV yet, so the
 # newsletter is never empty on first use.
 DEFAULT_PROFILE = {
     "categories": ["cs.CL", "cs.AI"],
     "keywords": ["retrieval augmented generation"],
 }
+
+
+def _dedup(seq):
+    """Order-preserving de-duplication, dropping empties."""
+    seen, out = set(), []
+    for x in seq:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 
 # ==========================================================================
@@ -98,8 +108,8 @@ def _chat(system, user, max_new_tokens=300, expect_json=False):
 
     messages.append({"role": "assistant", "content": text})
     messages.append({"role": "user", "content": (
-        f"A tua resposta anterior não era JSON válido:\n{text}\n\n"
-        "Responde APENAS com JSON válido, sem texto à volta.")})
+        f"Your previous answer was not valid JSON:\n{text}\n\n"
+        "Reply ONLY with valid JSON, no surrounding text.")})
     prompt2 = tok.apply_chat_template(messages, tokenize=False,
                                       add_generation_prompt=True)
     out2 = gen(prompt2, max_new_tokens=max_new_tokens, do_sample=False,
@@ -110,20 +120,16 @@ def _chat(system, user, max_new_tokens=300, expect_json=False):
 # ==========================================================================
 #  Search history — what feeds the compacted context
 # ==========================================================================
-def record_search(subject_label, category, keyword, mode, profile_slug=None):
+def record_search(subject_label, category, keyword, mode):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     entry = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
              "mode": mode, "subject_label": subject_label,
-             "category": category, "keyword": keyword or "",
-             "profile_slug": profile_slug or ""}
+             "category": category, "keyword": keyword or ""}
     with open(HISTORY_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def load_recent_history(days=30, profile_slug=None):
-    """If profile_slug is given, only entries recorded under that profile
-    are returned; otherwise all recent entries are returned (this is also
-    the behaviour when no profile has ever been created)."""
+def load_recent_history(days=30):
     if not HISTORY_PATH.exists():
         return []
     cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
@@ -138,172 +144,195 @@ def load_recent_history(days=30, profile_slug=None):
                 ts = datetime.datetime.fromisoformat(entry["ts"])
             except (json.JSONDecodeError, KeyError, ValueError):
                 continue
-            if ts < cutoff:
-                continue
-            if profile_slug and entry.get("profile_slug") != profile_slug:
-                continue
-            out.append(entry)
+            if ts >= cutoff:
+                out.append(entry)
     return out
 
 
 # ==========================================================================
-#  Profile — who the newsletter is for (extracted from an uploaded CV)
+#  CV profile — extract the user's name + research interests from a pasted CV
 # ==========================================================================
-def extract_text_from_pdf(file_bytes):
-    from pypdf import PdfReader
-    import io
-    reader = PdfReader(io.BytesIO(file_bytes))
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+CV_PROFILE_PATH = DATA_DIR / "cv_profile.json"
+
+# Best-effort mapping from free-text interests to the arXiv category codes we
+# support. First matching hint wins per category.
+_INTEREST_CATEGORY_HINTS = [
+    ("cs.CL", ("nlp", "natural language", "language", "linguistic",
+               "translation", "text mining", "retrieval", "rag",
+               "question answering", "summari")),
+    ("cs.CV", ("vision", "image", "video", "segmentation", "object detection")),
+    ("cs.LG", ("machine learning", "deep learning", "neural network",
+               "representation learning", "self-supervised")),
+    ("cs.AI", ("artificial intelligence", "reasoning", "agent", "planning",
+               "knowledge graph")),
+    ("cs.RO", ("robot", "manipulation", "autonomous", "control")),
+    ("cs.CR", ("security", "cryptograph", "privacy", "adversarial")),
+    ("cs.HC", ("human-computer", "human computer", "interaction", "usability")),
+    ("cs.SE", ("software engineering", "software", "program analysis")),
+    ("stat.ML", ("statistical learning", "bayesian", "statistics")),
+    ("eess.SP", ("signal processing", "signal")),
+    ("math.OC", ("optimization", "optimisation", "control theory")),
+    ("quant-ph", ("quantum",)),
+    ("astro-ph", ("astro", "cosmolog", "galax")),
+    ("q-bio", ("biolog", "genom", "protein", "neuroscience")),
+    ("q-fin.ST", ("finance", "financial", "trading", "market")),
+    ("econ.EM", ("econometric", "econom")),
+]
 
 
-def _sanitize_cv_profile(result):
-    if not isinstance(result, dict):
+def _map_interests_to_categories(interests, limit=3):
+    """Map free-text interests to supported arXiv category codes."""
+    valid = set(arxiv_api.CATEGORIES.values())
+    found = []
+    for interest in interests:
+        low = interest.lower()
+        for cat, hints in _INTEREST_CATEGORY_HINTS:
+            if cat in valid and cat not in found \
+                    and any(h in low for h in hints):
+                found.append(cat)
+    return found[:limit] or list(DEFAULT_PROFILE["categories"])
+
+
+def _shorten_term(term):
+    """Reduce a free-text interest to a short, arXiv-searchable keyword: take
+    the first segment before a separator (& / , : ' and ' dash) and keep at
+    most 3 words. Bare hyphens are preserved (e.g. 'retrieval-augmented')."""
+    term = (term or "").strip()
+    if not term:
+        return ""
+    term = re.split(r"\s*(?:&|/|,|:|\band\b|–|—| - )\s*", term, maxsplit=1)[0]
+    return " ".join(term.split()[:3]).strip().lower()
+
+
+def _guess_name_fallback(cv_text):
+    """Heuristic used when the LLM fails to return a name: a CV's name is
+    usually the first short, capitalised, digit/@-free line at the top."""
+    lines = [ln.strip() for ln in cv_text.splitlines()[:15] if ln.strip()]
+    for ln in lines:
+        words = ln.split()
+        if 1 < len(words) <= 4 and "@" not in ln \
+                and not any(ch.isdigit() for ch in ln) \
+                and sum(w[:1].isupper() for w in words) >= 2:
+            return ln
+    return lines[0][:40] if lines else ""
+
+
+def extract_cv_profile(cv_text):
+    """
+    Extract the person's name and research interests from pasted CV text, using
+    the local LLM with a deterministic fallback. Interests are also mapped to
+    arXiv categories, which is what drives the personalised newsletter.
+    Returns {name, interests: [...], categories: [...]} or None for empty input.
+    """
+    cv_text = (cv_text or "").strip()
+    if not cv_text:
         return None
-    name = (result.get("name") or "").strip()
-    summary = (result.get("summary") or "").strip()
-    if not name or not summary:
-        return None
-
-    valid_categories = set(arxiv_api.CATEGORIES.values())
-    categories = [c for c in (result.get("categories") or [])
-                 if c in valid_categories][:3] or DEFAULT_PROFILE["categories"]
-    keywords = [k for k in (result.get("keywords") or [])
-               if isinstance(k, str) and k.strip()][:3] or \
-        DEFAULT_PROFILE["keywords"]
-    return {"name": name, "summary": summary, "categories": categories,
-           "keywords": keywords}
-
-
-def analyze_cv(pdf_bytes):
-    """Extract a name + interest profile from an uploaded CV PDF via the
-    local LLM. Returns None if the PDF has no usable text or the model's
-    output can't be sanitized into a usable profile — callers should show
-    an error rather than silently falling back, since this is a direct,
-    explicit user action."""
-    text = extract_text_from_pdf(pdf_bytes).strip()
-    if len(text) < 50:
-        return None
-
-    valid_categories = ", ".join(sorted(set(arxiv_api.CATEGORIES.values())))
-    user_prompt = (
-        f"Currículo (texto extraído de PDF):\n{text[:6000]}\n\n"
-        "A partir deste currículo, identifica:\n"
-        "1. O nome completo da pessoa.\n"
-        "2. Um resumo curto (1-2 frases, português) das áreas de "
-        "investigação/trabalho que parecem ser do interesse desta pessoa, "
-        "com base na experiência, competências e projetos descritos.\n"
-        "3. Até 3 categorias arXiv relevantes, escolhidas APENAS desta "
-        f"lista: {valid_categories}\n"
-        "4. Até 3 palavras-chave em inglês para pesquisar artigos "
-        "científicos sobre a área desta pessoa.\n\n"
-        "Responde APENAS com JSON válido. Exemplo do FORMATO (inventa "
-        "sempre conteúdo novo, a partir do currículo acima — nunca copies "
-        "este exemplo):\n"
-        '{"name": "Maria Silva", "summary": "Trabalha em visão '
-        'computacional aplicada a robótica, com foco recente em modelos '
-        'de deteção de objetos em tempo real.", "categories": ["cs.CV", '
-        '"cs.RO"], "keywords": ["object detection", "robotics"]}'
-    )
     result = _chat(
-        system=("Extrais informação estruturada de currículos para "
-               "personalizar recomendações de artigos científicos."),
-        user=user_prompt, max_new_tokens=250, expect_json=True,
+        system=("You extract structured information from CVs / resumes. You "
+                "reply ONLY with valid JSON, no surrounding text."),
+        user=(f"Here is the text of a CV:\n\n{cv_text[:4000]}\n\n"
+              "Extract: (1) the person's full name; (2) 3 to 6 research "
+              "interests or technical topics they focus on. Reply ONLY with "
+              'JSON: {"name": "...", "interests": ["...", "..."]}.'),
+        max_new_tokens=200, expect_json=True,
     )
-    return _sanitize_cv_profile(result)
+    name, interests = "", []
+    if isinstance(result, dict):
+        name = str(result.get("name") or "").strip()
+        raw = result.get("interests")
+        if isinstance(raw, list):
+            interests = [str(x).strip() for x in raw if str(x).strip()]
+    if not name:
+        name = _guess_name_fallback(cv_text)
+    interests = interests[:6]
+    # short, searchable keywords derived from the (possibly long) interests
+    keywords = _dedup(_shorten_term(i) for i in interests)
+    return {"name": name or "Reader", "interests": interests,
+            "keywords": keywords,
+            "categories": _map_interests_to_categories(interests)}
 
 
-def _slugify(name):
-    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
-    return slug or "utilizador"
-
-
-def save_profile(profile):
-    """Saves one JSON file per person (keyed by their CV name), so multiple
-    people can each have their own profile on the same local install.
-    Returns the slug, which callers use to mark this profile as active."""
-    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
-    slug = _slugify(profile["name"])
-    profile = {**profile, "slug": slug}
-    (PROFILES_DIR / f"{slug}.json").write_text(
+def save_cv_profile(profile):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    CV_PROFILE_PATH.write_text(
         json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
-    return slug
 
 
-def list_profiles():
-    """All saved profiles, most recently updated first."""
-    if not PROFILES_DIR.exists():
-        return []
-    files = sorted(PROFILES_DIR.glob("*.json"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
-    out = []
-    for fp in files:
-        try:
-            out.append(json.loads(fp.read_text(encoding="utf-8")))
-        except json.JSONDecodeError:
-            continue
-    return out
-
-
-def load_profile(slug=None):
-    """The profile matching slug, or the most recently updated one if slug
-    is None/not found, or None if no profile has been created yet."""
-    profiles = list_profiles()
-    if not profiles:
+def load_cv_profile():
+    if not CV_PROFILE_PATH.exists():
         return None
-    if slug:
-        for p in profiles:
-            if p.get("slug") == slug:
-                return p
-    return profiles[0]
+    try:
+        return json.loads(CV_PROFILE_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def clear_cv_profile():
+    CV_PROFILE_PATH.unlink(missing_ok=True)
+
+
+def invalidate_current_week():
+    """Drop this week's cached issue so the next view regenerates it (used when
+    the CV profile changes, since it feeds the newsletter)."""
+    (CACHE_DIR / f"{_iso_week_key()}.json").unlink(missing_ok=True)
 
 
 # ==========================================================================
-#  Step 1 — compact context
+#  Step 1 — compact context (search history + CV interests)
 # ==========================================================================
-def compact_context(history, profile_slug=None):
-    profile = load_profile(profile_slug)
+def compact_context(history, cv_profile=None):
+    cv_profile = cv_profile or {}
+    cv_name = (cv_profile.get("name") or "").strip()
+    cv_interests = [i for i in cv_profile.get("interests", []) if i]
+    cv_categories = [c for c in cv_profile.get("categories", []) if c]
+    # short search keywords (fall back to interests for older saved profiles)
+    cv_keywords = [k for k in cv_profile.get("keywords", []) if k] \
+        or [_shorten_term(i) for i in cv_interests]
 
-    if not history:
-        if profile:
-            return {"summary": profile["summary"],
-                   "top_categories": profile["categories"],
-                   "top_keywords": profile["keywords"], "n_searches": 0}
-        return {
-            "summary": ("Ainda sem pesquisas nem CV carregado — a mostrar "
-                        "sugestões iniciais alinhadas com RAG e IA aplicada."),
-            "top_categories": DEFAULT_PROFILE["categories"],
-            "top_keywords": DEFAULT_PROFILE["keywords"],
-            "n_searches": 0,
-        }
-
-    base_categories = profile["categories"] if profile \
-        else DEFAULT_PROFILE["categories"]
-    base_keywords = profile["keywords"] if profile else []
     cat_counts = Counter(h["category"] for h in history if h.get("category"))
     kw_counts = Counter(h["keyword"] for h in history if h.get("keyword"))
-    top_categories = [c for c, _ in cat_counts.most_common(3)] or base_categories
-    top_keywords = [k for k, _ in kw_counts.most_common(3)] or base_keywords
+    hist_categories = [c for c, _ in cat_counts.most_common(3)]
+    hist_keywords = [k for k, _ in kw_counts.most_common(3)]
 
-    stats_text = (f"{len(history)} pesquisas recentes. Categorias mais "
-                 f"pesquisadas: {', '.join(top_categories)}."
-                 + (f" Palavras-chave: {', '.join(top_keywords)}."
-                    if top_keywords else ""))
-    if profile:
-        stats_text += f" Perfil profissional (do CV): {profile['summary']}"
+    # CV categories/keywords take priority, then recent search history.
+    top_categories = _dedup(cv_categories + hist_categories)[:3] \
+        or list(DEFAULT_PROFILE["categories"])
+    top_keywords = _dedup(cv_keywords + hist_keywords)[:4] \
+        or list(DEFAULT_PROFILE["keywords"])
+
+    if not history and not cv_interests and not cv_name:
+        return {
+            "summary": ("No searches or CV yet — showing starter suggestions "
+                        "aligned with applied AI and NLP."),
+            "top_categories": DEFAULT_PROFILE["categories"],
+            "top_keywords": DEFAULT_PROFILE["keywords"],
+            "n_searches": 0, "name": "",
+        }
+
+    parts = []
+    if cv_name:
+        parts.append(f"User: {cv_name}.")
+    if cv_interests:
+        parts.append("Research interests (from CV): "
+                     + ", ".join(cv_interests) + ".")
+    if history:
+        parts.append(f"{len(history)} recent searches. Top categories: "
+                     + ", ".join(hist_categories) + "."
+                     + (f" Keywords: {', '.join(hist_keywords)}."
+                        if hist_keywords else ""))
+    stats_text = " ".join(parts)
 
     summary = _chat(
-        system=("És um assistente que resume interesses de investigação em "
-               "português europeu, em 1-2 frases curtas e naturais, sem "
-               "introduções como 'Aqui está'."),
-        user=f"Estatísticas de um utilizador:\n{stats_text}\n\n"
-            "Escreve um resumo curto (1-2 frases) do que este utilizador "
-            "parece estar a investigar ultimamente, combinando o perfil "
-            "profissional com as pesquisas recentes (quando ambos existirem).",
+        system=("You summarise a person's research interests in 1-2 short, "
+                "natural English sentences, with no preamble like 'Here is'."),
+        user=(f"A user's profile:\n{stats_text}\n\n"
+              "Write a short (1-2 sentence) summary of what this person seems "
+              "to be researching or interested in lately."),
         max_new_tokens=100,
     )
     return {"summary": (summary or "").strip() or stats_text,
-           "top_categories": top_categories, "top_keywords": top_keywords,
-           "n_searches": len(history)}
+            "top_categories": top_categories, "top_keywords": top_keywords,
+            "n_searches": len(history), "name": cv_name}
 
 
 # ==========================================================================
@@ -330,20 +359,18 @@ def _sanitize_queries(result, context):
 
 def plan_queries(context):
     user_prompt = (
-        f"Contexto do utilizador: {context['summary']}\n"
-        f"Categorias mais pesquisadas: "
-        f"{', '.join(context['top_categories']) or 'nenhuma'}\n"
-        f"Palavras-chave: {', '.join(context['top_keywords']) or 'nenhuma'}\n"
-        f"Categorias arXiv válidas: {', '.join(arxiv_api.CATEGORIES.values())}\n\n"
-        "Sugere entre 1 e 3 pesquisas no arXiv para encontrar os papers mais "
-        "relevantes para este utilizador esta semana. Responde APENAS com "
-        'JSON: uma lista de objetos {"category": "<código arXiv válido>", '
-        '"keyword": "<palavra-chave ou vazio>"}.'
+        f"User context: {context['summary']}\n"
+        f"Most-searched categories: "
+        f"{', '.join(context['top_categories']) or 'none'}\n"
+        f"Keywords: {', '.join(context['top_keywords']) or 'none'}\n"
+        f"Valid arXiv categories: {', '.join(arxiv_api.CATEGORIES.values())}\n\n"
+        "Suggest 1 to 3 arXiv searches to find the most relevant papers for "
+        "this user this week. Reply ONLY with JSON: a list of objects "
+        '{"category": "<valid arXiv code>", "keyword": "<keyword or empty>"}.'
     )
     result = _chat(
-        system=("És um assistente de investigação que decide que pesquisas "
-               "fazer no arXiv para satisfazer os interesses de um "
-               "utilizador."),
+        system=("You are a research assistant that decides which arXiv "
+                "searches to run to satisfy a user's interests."),
         user=user_prompt, max_new_tokens=120, expect_json=True,
     )
     return _sanitize_queries(result, context)
@@ -352,9 +379,17 @@ def plan_queries(context):
 def fetch_candidates(queries, per_query=8):
     seen = set()
     candidates = []
-    for q in queries:
-        docs = arxiv_api.collect_papers(q["category"], max_results=per_query,
-                                        keyword=q["keyword"] or None)
+    for i, q in enumerate(queries):
+        if i:
+            time.sleep(3)   # stay under arXiv's rate limit between requests
+        try:
+            docs = arxiv_api.collect_papers(q["category"],
+                                            max_results=per_query,
+                                            keyword=q["keyword"] or None)
+        except Exception:
+            # one failing query (e.g. a stubborn 429) shouldn't sink the whole
+            # newsletter — skip it and build from whatever else we can fetch
+            continue
         for d in docs:
             key = d.get("link") or d.get("title")
             if key in seen:
@@ -399,17 +434,16 @@ def select_top10(candidates, context, n=TOP_N):
         for i, d in enumerate(candidates)
     )
     user_prompt = (
-        f"Contexto do utilizador: {context['summary']}\n\n"
-        f"Candidatos (numerados, agrupados por cluster de sub-tópico):\n"
+        f"User context: {context['summary']}\n\n"
+        f"Candidates (numbered, grouped by sub-topic cluster):\n"
         f"{listing}\n\n"
-        f"Escolhe os {n} mais relevantes E diversos (tenta cobrir vários "
-        "clusters, não só o maior). Responde APENAS com JSON: lista dos "
-        "índices escolhidos, ex: [0, 3, 7, ...]."
+        f"Pick the {n} most relevant AND diverse ones (try to cover several "
+        "clusters, not just the biggest). Reply ONLY with JSON: a list of the "
+        "chosen indices, e.g. [0, 3, 7, ...]."
     )
     result = _chat(
-        system=("És um editor de newsletter que seleciona os melhores "
-               "artigos científicos para um utilizador, equilibrando "
-               "relevância e diversidade de temas."),
+        system=("You are a newsletter editor selecting the best scientific "
+                "papers for a user, balancing relevance and topic diversity."),
         user=user_prompt, max_new_tokens=100, expect_json=True,
     )
     indices = _sanitize_indices(result, len(candidates), n)
@@ -420,8 +454,8 @@ def select_top10(candidates, context, n=TOP_N):
 #  Step 4 — summaries + weekly preview (one batched LLM call)
 # ==========================================================================
 def _sanitize_summaries(result, selected):
-    fallback_preview = ("A seleção desta semana cobre os temas que mais "
-                        "tens pesquisado.")
+    fallback_preview = ("This week's selection covers the topics you've been "
+                        "exploring the most.")
     fallback_summaries = [d["abstract"][:180].rsplit(" ", 1)[0] + "…"
                           for d in selected]
     if not isinstance(result, dict):
@@ -442,27 +476,25 @@ def summarize_and_preview(selected, context):
         for i, d in enumerate(selected)
     )
     user_prompt = (
-        f"Contexto do utilizador: {context['summary']}\n\n"
-        f"Artigos selecionados ({len(selected)} no total):\n{listing}\n\n"
-        "Para cada artigo, escreve um resumo de UMA frase curta em "
-        "português, claro e específico (não repitas o título). Escreve "
-        "também um parágrafo de preview (1-2 frases, português) sobre os "
-        "destaques desta semana.\n\n"
-        "Responde APENAS com JSON válido. Exemplo do FORMATO (inventa "
-        "sempre conteúdo novo — nunca copies este exemplo):\n"
-        '{"preview": "Esta semana destacam-se novos métodos de recuperação '
-        'híbrida e agentes para tarefas científicas.", "summaries": '
-        '["Este artigo propõe uma técnica que reduz o custo de indexação '
-        'em bases vetoriais grandes.", "Este trabalho mostra que agentes '
-        'multi-passo superam abordagens de único passo em tarefas '
-        'complexas."]}\n\n'
-        f'A tua lista "summaries" tem de ter exatamente {len(selected)} '
-        "elementos — um por artigo, pela mesma ordem da lista acima."
+        f"User context: {context['summary']}\n\n"
+        f"Selected papers ({len(selected)} total):\n{listing}\n\n"
+        "For each paper, write a single short, clear, specific one-sentence "
+        "summary in English (do not repeat the title). Also write a short "
+        "preview paragraph (1-2 sentences) about this week's highlights.\n\n"
+        "Reply ONLY with valid JSON. FORMAT example (always invent new "
+        "content — never copy this example):\n"
+        '{"preview": "This week features new hybrid retrieval methods and '
+        'agents for scientific tasks.", "summaries": '
+        '["This paper proposes a technique that cuts indexing cost in large '
+        'vector databases.", "This work shows that multi-step agents '
+        'outperform single-step approaches on complex tasks."]}\n\n'
+        f'Your "summaries" list must have exactly {len(selected)} elements — '
+        "one per paper, in the same order as the list above."
     )
     result = _chat(
-        system=("És um editor de newsletter científica que escreve resumos "
-               "curtos, claros e fiéis ao conteúdo original, em português "
-               "europeu."),
+        system=("You are a science newsletter editor who writes short, clear "
+                "summaries that stay faithful to the original content, in "
+                "English."),
         user=user_prompt, max_new_tokens=480, expect_json=True,
     )
     return _sanitize_summaries(result, selected)
@@ -475,29 +507,29 @@ def critique(draft):
     items = draft["items"]
     issues = []
     if len(items) != TOP_N:
-        issues.append(f"esperado {TOP_N} itens, encontrados {len(items)}")
+        issues.append(f"expected {TOP_N} items, found {len(items)}")
     titles = [it["title"] for it in items]
     if len(set(titles)) != len(titles):
-        issues.append("há títulos duplicados")
+        issues.append("duplicate titles present")
     for it in items:
-        summ = (it.get("summary_pt") or "").strip()
+        summ = (it.get("summary") or "").strip()
         if len(summ) < 15 or summ.lower() in it["title"].lower():
-            issues.append(f"resumo fraco/repetido para: {it['title'][:60]}")
+            issues.append(f"weak/repeated summary for: {it['title'][:60]}")
 
     if issues:
         return {"ok": False, "issues": issues}
 
-    listing = "\n".join(f"- {it['title']}: {it['summary_pt']}" for it in items)
+    listing = "\n".join(f"- {it['title']}: {it['summary']}" for it in items)
     user_prompt = (
-        f"Preview: {draft['preview']}\n\nItens:\n{listing}\n\n"
-        "Avalia esta newsletter: os itens são relevantes e diversos entre "
-        "si? Os resumos são específicos e úteis? Responde APENAS com JSON. "
-        'Se estiver tudo bem: {"ok": true, "issues": []}. Se houver '
-        'problemas, descreve-os: {"ok": false, "issues": ["resumo 3 é '
-        'vago", "item 7 não parece relevante"]}.'
+        f"Preview: {draft['preview']}\n\nItems:\n{listing}\n\n"
+        "Evaluate this newsletter: are the items relevant and diverse from "
+        "each other? Are the summaries specific and useful? Reply ONLY with "
+        'JSON. If all good: {"ok": true, "issues": []}. If there are '
+        'problems, describe them: {"ok": false, "issues": ["summary 3 is '
+        'vague", "item 7 does not seem relevant"]}.'
     )
     result = _chat(
-        system="És um crítico exigente de newsletters científicas.",
+        system="You are a demanding critic of science newsletters.",
         user=user_prompt, max_new_tokens=120, expect_json=True,
     )
     if isinstance(result, dict) and "ok" in result:
@@ -520,9 +552,9 @@ def week_range_label(d=None):
     monday = d - datetime.timedelta(days=d.weekday())
     sunday = monday + datetime.timedelta(days=6)
     if monday.month == sunday.month:
-        return f"{monday.day}–{sunday.day} de {MONTHS_PT[monday.month]}"
-    return (f"{monday.day} de {MONTHS_PT[monday.month]} – "
-            f"{sunday.day} de {MONTHS_PT[sunday.month]}")
+        return f"{MONTHS[monday.month]} {monday.day}–{sunday.day}"
+    return (f"{MONTHS[monday.month]} {monday.day} – "
+            f"{MONTHS[sunday.month]} {sunday.day}")
 
 
 def _build_draft(context, week_key, attempt, progress=None):
@@ -530,24 +562,24 @@ def _build_draft(context, week_key, attempt, progress=None):
         if progress:
             progress(msg)
 
-    step("A planear pesquisas no arXiv com base no teu contexto...")
+    step("Planning arXiv searches from your context...")
     queries = plan_queries(context)
 
-    step(f"A procurar candidatos no arXiv ({', '.join(q['category'] for q in queries)})...")
+    step(f"Searching arXiv for candidates ({', '.join(q['category'] for q in queries)})...")
     candidates = fetch_candidates(queries)
     if not candidates:
         queries = [{"category": c, "keyword": ""}
                   for c in DEFAULT_PROFILE["categories"]]
         candidates = fetch_candidates(queries)
 
-    step(f"A selecionar os {TOP_N} mais relevantes e diversos "
-        f"({len(candidates)} candidatos)...")
+    step(f"Selecting the {TOP_N} most relevant and diverse "
+        f"({len(candidates)} candidates)...")
     selected = select_top10(candidates, context)
 
-    step("A escrever resumos e o preview da semana...")
+    step("Writing summaries and this week's preview...")
     preview, summaries = summarize_and_preview(selected, context)
     items = [
-        {"title": d["title"], "authors": d["authors"][:4], "summary_pt": s,
+        {"title": d["title"], "authors": d["authors"][:4], "summary": s,
          "arxiv_id": d["link"].rsplit("/", 1)[-1] if d.get("link") else "",
          "link": d["link"], "pdf_url": d["pdf_url"]}
         for d, s in zip(selected, summaries)
@@ -559,70 +591,62 @@ def _build_draft(context, week_key, attempt, progress=None):
            "refine_iterations": attempt}
 
 
-def _cache_dir_for(profile_slug):
-    """Cache lives in a per-profile subdirectory (not a filename prefix) so
-    similar slugs — e.g. 'ana' vs 'ana-silva' — can never collide."""
-    return CACHE_DIR / (profile_slug or "default")
-
-
-def generate_weekly_newsletter(force=False, progress=None, profile_slug=None):
+def generate_weekly_newsletter(force=False, progress=None):
     """progress, if given, is called with a short Portuguese status string
     before each pipeline stage — lets the UI show real step-by-step
     feedback instead of an opaque spinner during the (rare) 1-2 min a full
     generation takes."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     week_key = _iso_week_key()
-    cache_dir = _cache_dir_for(profile_slug)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{week_key}.json"
+    cache_path = CACHE_DIR / f"{week_key}.json"
     if cache_path.exists() and not force:
         return json.loads(cache_path.read_text(encoding="utf-8"))
 
     if progress:
-        progress("A compactar o teu contexto de pesquisas...")
-    history = load_recent_history(profile_slug=profile_slug)
-    context = compact_context(history, profile_slug=profile_slug)
+        progress("Compacting your context (searches + CV)...")
+    context = compact_context(load_recent_history(), load_cv_profile())
 
     draft = None
     for attempt in range(MAX_REFINE_LOOPS + 1):
         draft = _build_draft(context, week_key, attempt, progress=progress)
         if progress:
-            progress("A rever a qualidade da seleção...")
+            progress("Reviewing the quality of the selection...")
         result = critique(draft)
         if result["ok"]:
             draft["quality_flag"] = None
             break
         draft["quality_flag"] = "; ".join(result["issues"]) \
-            or "qualidade não confirmada"
+            or "quality not confirmed"
         if progress and attempt < MAX_REFINE_LOOPS:
-            progress("Qualidade insuficiente — a refinar a seleção...")
+            progress("Quality insufficient — refining the selection...")
 
-    draft["profile_slug"] = profile_slug or ""
     cache_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2),
                           encoding="utf-8")
     return draft
 
 
-def peek_current_issue(profile_slug=None):
+def peek_current_issue():
     """Read the current week's cached issue without triggering generation —
     used by the sidebar so just viewing it never calls the LLM."""
-    cache_path = _cache_dir_for(profile_slug) / f"{_iso_week_key()}.json"
+    cache_path = CACHE_DIR / f"{_iso_week_key()}.json"
     if not cache_path.exists():
         return None
-    return json.loads(cache_path.read_text(encoding="utf-8"))
+    with open(cache_path, encoding="utf-8") as f:
+        return json.load(f)
 
 
-def list_past_issues(profile_slug=None, limit=4):
-    cache_dir = _cache_dir_for(profile_slug)
-    if not cache_dir.exists():
+def list_past_issues(limit=4):
+    if not CACHE_DIR.exists():
         return []
     current = _iso_week_key()
-    files = sorted(cache_dir.glob("*.json"), reverse=True)
+    files = sorted(CACHE_DIR.glob("*.json"), reverse=True)
     out = []
     for fp in files:
         if fp.stem == current:
             continue
         try:
-            out.append(json.loads(fp.read_text(encoding="utf-8")))
+            with open(fp, encoding="utf-8") as f:
+                out.append(json.load(f))
         except (json.JSONDecodeError, OSError):
             continue
         if len(out) >= limit:
