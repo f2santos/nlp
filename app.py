@@ -14,6 +14,8 @@ Run locally:   streamlit run app.py
 """
 
 import datetime
+import html
+import io
 import textwrap
 from collections import Counter
 
@@ -42,72 +44,123 @@ def inject_css():
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
-      html, body, [class*="css"]  { font-family: 'Inter', sans-serif; }
-      h1, h2, h3 { font-family: 'Fraunces', serif !important; color: #241F1A; }
+      :root {
+        --ink: #1A1712; --muted: #6B6259; --faint: #A79C8D;
+        --accent: #C9673F; --accent-dark: #A84E2C; --accent-soft: #FBEDE4;
+        --line: #ECE3D6; --card: #FFFFFF;
+      }
+      html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+      h1, h2, h3 { font-family: 'Fraunces', serif !important; color: var(--ink); }
       footer { visibility: hidden; }
+      .stApp {
+        background:
+          radial-gradient(1200px 500px at 50% -8%, #FDF1E7 0%, rgba(253,241,231,0) 60%),
+          linear-gradient(180deg, #FDFBF7 0%, #F7F2EA 100%);
+      }
       div.stButton > button, div.stFormSubmitButton > button {
-        border-radius: 999px !important;
+        border-radius: 12px !important;
         font-weight: 600 !important;
-        transition: transform .15s ease, box-shadow .15s ease !important;
+        border: 1px solid var(--line) !important;
+        transition: transform .15s ease, box-shadow .15s ease,
+                    background .15s ease, border-color .15s ease !important;
       }
       div.stButton > button:hover, div.stFormSubmitButton > button:hover {
         transform: translateY(-1px);
+        box-shadow: 0 6px 16px rgba(36,31,26,.10) !important;
       }
+      div.stButton > button[kind="primary"] {
+        background: var(--accent) !important; color: #fff !important;
+        border-color: var(--accent) !important;
+      }
+      div.stButton > button[kind="primary"]:hover {
+        background: var(--accent-dark) !important; border-color: var(--accent-dark) !important;
+      }
+      div.stButton > button[kind="secondary"] {
+        background: #fff !important; color: var(--ink) !important;
+      }
+      div.stButton > button[kind="secondary"]:hover { border-color: var(--accent) !important; }
+      .mf-nav {
+        display: flex; align-items: center; justify-content: space-between;
+        max-width: 1080px; margin: .2rem auto 2.6rem auto; padding: 0 .4rem;
+      }
+      .mf-nav-brand { font-family: 'Fraunces', serif; font-weight: 600; font-size: 1.3rem; color: var(--ink); }
+      .mf-nav-brand span { color: var(--accent); }
+      .mf-nav-tag { font-size: .85rem; color: var(--muted); font-weight: 500; }
       .mf-eyebrow {
-        text-align: center; letter-spacing: .18em; text-transform: uppercase;
-        font-size: .75rem; font-weight: 600; color: #C9673F; margin-bottom: .75rem;
+        display: inline-block; letter-spacing: .16em; text-transform: uppercase;
+        font-size: .72rem; font-weight: 700; color: var(--accent);
+        background: var(--accent-soft); border: 1px solid #F3DBC9;
+        padding: .34rem .8rem; border-radius: 999px; margin: 0 auto .95rem auto;
       }
+      .mf-hero-wrap { text-align: center; }
       .mf-hero-title {
-        text-align: center; font-family: 'Fraunces', serif; font-weight: 600;
-        font-size: 4.2rem; line-height: 1.05; color: #241F1A; margin: 0;
+        font-family: 'Fraunces', serif; font-weight: 600;
+        font-size: 4.6rem; line-height: 1.03; color: var(--ink); margin: 0;
+        letter-spacing: -.02em;
       }
-      .mf-hero-title span { color: #C9673F; }
+      .mf-hero-title span { color: var(--accent); }
       .mf-hero-sub {
-        text-align: center; font-size: 1.15rem; color: #6B6259; max-width: 620px;
-        margin: 1.1rem auto 3rem auto; line-height: 1.6;
+        font-size: 1.16rem; color: var(--muted); max-width: 600px;
+        margin: 1.15rem auto 2.8rem auto; line-height: 1.65;
       }
       .mf-card {
-        background: #FFFFFF; border-radius: 20px; padding: 2.1rem 1.9rem 1.4rem;
-        box-shadow: 0 1px 3px rgba(36,31,26,.06), 0 12px 28px rgba(36,31,26,.05);
-        border: 1px solid #F0EAE1; margin-bottom: .9rem;
-        min-height: 300px; display: flex; flex-direction: column;
-        justify-content: flex-start;
+        background: var(--card); border-radius: 18px; padding: 2rem 1.85rem 1.5rem;
+        box-shadow: 0 1px 2px rgba(36,31,26,.05), 0 14px 34px rgba(36,31,26,.06);
+        border: 1px solid var(--line); margin-bottom: .85rem;
+        height: 300px; display: flex; flex-direction: column;
+        transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+      }
+      .mf-card:hover {
+        transform: translateY(-4px); border-color: #E6D3C0;
+        box-shadow: 0 6px 14px rgba(36,31,26,.07), 0 22px 48px rgba(36,31,26,.10);
       }
       .mf-icon {
-        width: 52px; height: 52px; border-radius: 14px; background: #FBEDE4;
+        width: 54px; height: 54px; border-radius: 15px; background: var(--accent-soft);
         display: flex; align-items: center; justify-content: center;
-        font-size: 1.5rem; margin-bottom: 1rem;
+        font-size: 1.55rem; margin-bottom: 1.1rem;
       }
-      .mf-card h3 { margin: 0 0 .5rem 0; font-size: 1.35rem; }
-      .mf-card p { color: #6B6259; font-size: .95rem; line-height: 1.55; min-height: 4.6em; }
+      .mf-card h3 { margin: 0 0 .55rem 0; font-size: 1.4rem; }
+      .mf-card p { color: var(--muted); font-size: .96rem; line-height: 1.58; margin: 0; }
       .mf-badge {
         display: inline-block; font-size: .7rem; font-weight: 600; letter-spacing: .06em;
         text-transform: uppercase; background: #F0EAE1; color: #8A7F70;
         padding: .2rem .55rem; border-radius: 999px; margin-bottom: .6rem;
       }
-      .mf-badge-accent { background: #C9673F; color: #FFFFFF; }
-      .mf-footer { text-align: center; color: #A79C8D; font-size: .82rem; margin-top: 3rem; }
+      .mf-badge-accent { background: var(--accent); color: #fff; }
+      .mf-strip {
+        display: flex; flex-wrap: wrap; gap: 1rem; justify-content: center;
+        margin: 3rem auto 1rem auto; max-width: 900px;
+      }
+      .mf-chip {
+        display: flex; align-items: center; gap: .55rem;
+        background: rgba(255,255,255,.7); border: 1px solid var(--line);
+        border-radius: 999px; padding: .55rem 1.05rem;
+        font-size: .86rem; font-weight: 500; color: #4E463D;
+      }
+      .mf-chip span { font-size: 1.05rem; }
+      .mf-footer { text-align: center; color: var(--faint); font-size: .82rem;
+        margin-top: 2.6rem; padding-top: 1.4rem; border-top: 1px solid var(--line); }
       .mf-rail-card {
-        background: #FFFFFF; border-radius: 18px; padding: 1.4rem 1.3rem;
-        margin-bottom: 1rem; border: 1px solid #F0EAE1;
+        background: var(--card); border-radius: 16px; padding: 1.4rem 1.3rem;
+        margin-bottom: 1rem; border: 1px solid var(--line);
         box-shadow: 0 1px 3px rgba(36,31,26,.05);
       }
       .mf-avatar {
-        width: 46px; height: 46px; border-radius: 50%; background: #C9673F;
-        color: #FFFFFF; display: flex; align-items: center; justify-content: center;
+        width: 46px; height: 46px; border-radius: 50%; background: var(--accent);
+        color: #fff; display: flex; align-items: center; justify-content: center;
         font-family: 'Fraunces', serif; font-size: 1.2rem; font-weight: 600;
         margin-bottom: .7rem;
       }
-      .mf-rail-name { font-family: 'Fraunces', serif; font-size: 1.15rem; font-weight: 600; color: #241F1A; }
+      .mf-rail-name { font-family: 'Fraunces', serif; font-size: 1.15rem; font-weight: 600; color: var(--ink); }
       .mf-rail-role { font-size: .82rem; color: #8A7F70; margin-top: .15rem; }
-      .mf-rail-title { font-weight: 600; color: #241F1A; margin-top: .3rem; }
-      .mf-rail-text { font-size: .85rem; color: #6B6259; line-height: 1.5; margin-top: .4rem; }
+      .mf-rail-title { font-weight: 600; color: var(--ink); margin-top: .3rem; }
+      .mf-rail-text { font-size: .85rem; color: var(--muted); line-height: 1.5; margin-top: .4rem; }
       .mf-feed-hero {
         background: linear-gradient(135deg, #FFF7F0, #FDECE3); border-radius: 20px;
         padding: 1.8rem 2rem; border: 1px solid #F3DFCF; margin-bottom: 1.6rem;
       }
       .mf-feed-hero h2 { margin: .5rem 0 .6rem 0; font-size: 1.6rem; }
-      .mf-hero-preview { color: #6B6259; font-size: .98rem; line-height: 1.6; margin: 0; }
+      .mf-hero-preview { color: var(--muted); font-size: .98rem; line-height: 1.6; margin: 0; }
     </style>
     """), unsafe_allow_html=True)
 
@@ -130,162 +183,278 @@ def top_nav():
 # ==========================================================================
 def render_landing():
     hide_sidebar()
+
+    st.markdown(textwrap.dedent("""
+    <div class="mf-nav">
+      <div class="mf-nav-brand">🧠 Mind<span>Feed</span></div>
+      <div class="mf-nav-tag">Research trend intelligence · powered by arXiv</div>
+    </div>
+    """), unsafe_allow_html=True)
+
     _, mid, _ = st.columns([1, 3.4, 1])
     with mid:
-        st.markdown('<div class="mf-eyebrow">Investigação em tempo real · '
-                    'via arXiv</div>', unsafe_allow_html=True)
-        st.markdown('<h1 class="mf-hero-title">Mind<span>Feed</span></h1>',
-                    unsafe_allow_html=True)
-        st.markdown(
-            '<p class="mf-hero-sub">Descobre as tendências de investigação '
-            'mais recentes — resumidas, organizadas por tópicos e à tua '
-            'medida, direto do arXiv.</p>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(textwrap.dedent("""
+        <div class="mf-hero-wrap">
+          <span class="mf-eyebrow">Real-time research · open models</span>
+          <h1 class="mf-hero-title">Mind<span>Feed</span></h1>
+          <p class="mf-hero-sub">Turn thousands of new papers into clear,
+          personalised insight. MindFeed reads the latest arXiv research,
+          detects the trends, and tailors them to you.</p>
+        </div>
+        """), unsafe_allow_html=True)
 
         col1, col2 = st.columns(2, gap="large")
         with col1:
-            st.markdown(
-                '<div class="mf-card">'
-                '<span class="mf-badge" style="visibility:hidden;">Em breve</span>'
-                '<div class="mf-icon">🔍</div>'
-                '<h3>Explorar tendências</h3>'
-                '<p>Pesquisa em tempo real nas últimas publicações do '
-                'arXiv, com deteção automática de tópicos, entidades e '
-                'resumos gerados por IA.</p>'
-                '</div>', unsafe_allow_html=True,
-            )
-            if st.button("Começar a explorar →", type="primary",
+            st.markdown(textwrap.dedent("""
+            <div class="mf-card">
+              <div class="mf-icon">🔍</div>
+              <h3>Explore trends</h3>
+              <p>Real-time search over the latest arXiv papers, with automatic
+              topic discovery, method &amp; concept extraction, and
+              AI-generated summaries.</p>
+            </div>
+            """), unsafe_allow_html=True)
+            if st.button("Start exploring →", type="primary",
                          use_container_width=True, key="go_search"):
                 st.session_state.page = "search"
                 st.rerun()
         with col2:
-            st.markdown(
-                '<div class="mf-card">'
-                '<span class="mf-badge">Em breve</span>'
-                '<div class="mf-icon">✉️</div>'
-                '<h3>Newsletter pessoal</h3>'
-                '<p>Um resumo feito à tua medida, com os temas e categorias '
-                'que mais te interessam, entregue quando quiseres.</p>'
-                '</div>', unsafe_allow_html=True,
-            )
-            if st.button("Configurar preferências →",
+            st.markdown(textwrap.dedent("""
+            <div class="mf-card">
+              <div class="mf-icon">✉️</div>
+              <h3>Personal newsletter</h3>
+              <p>A weekly digest tailored to you, built from the interests in
+              your CV and what you search — curated and summarised by a local
+              language model.</p>
+            </div>
+            """), unsafe_allow_html=True)
+            if st.button("Set up my feed →", type="primary",
                          use_container_width=True, key="go_newsletter"):
                 st.session_state.page = "newsletter"
                 st.rerun()
 
-        st.markdown(
-            '<div class="mf-footer">Dados reais via arXiv API · '
-            'Modelos open-source, sem custos</div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(textwrap.dedent("""
+        <div class="mf-strip">
+          <div class="mf-chip"><span>📡</span> Real arXiv data</div>
+          <div class="mf-chip"><span>🧩</span> Full NLP pipeline</div>
+          <div class="mf-chip"><span>🔒</span> Local models · no API key</div>
+          <div class="mf-chip"><span>✨</span> Personalised to you</div>
+        </div>
+        <div class="mf-footer">Real data via the arXiv API · Open-source
+        models, no cost · Built for the Applied NLP project</div>
+        """), unsafe_allow_html=True)
 
 
 # ==========================================================================
 #  Newsletter — personal dashboard, backed by the newsletter_agent pipeline
 # ==========================================================================
+def _read_cv_upload(uploaded):
+    """Return plain text from an uploaded CV file (.txt / .md / .pdf)."""
+    if uploaded is None:
+        return ""
+    data = uploaded.read()
+    if uploaded.name.lower().endswith(".pdf"):
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(data))
+            return "\n".join((p.extract_text() or "") for p in reader.pages)
+        except Exception:
+            return ""
+    return data.decode("utf-8", errors="ignore")
+
+
+def render_cv_form(profile):
+    """CV input area: paste text or upload a file; extract name + interests
+    (which drive the personalised newsletter)."""
+    with st.expander("📄 " + ("Update my CV" if profile else "Add my CV"),
+                     expanded=not profile):
+        cv_text = st.text_area(
+            "Paste your CV text", height=150, key="cv_text",
+            placeholder="Paste your CV / resume here...",
+        )
+        uploaded = st.file_uploader("…or upload a file (PDF / TXT)",
+                                    type=["pdf", "txt", "md"], key="cv_file")
+        c1, c2 = st.columns(2)
+        analyse = c1.button("Analyse CV", type="primary",
+                            use_container_width=True, key="cv_analyse")
+        if profile and c2.button("Remove", use_container_width=True,
+                                 key="cv_clear"):
+            na.clear_cv_profile()
+            na.invalidate_current_week()
+            st.rerun()
+
+        if analyse:
+            text = cv_text.strip() or _read_cv_upload(uploaded)
+            if not text.strip():
+                st.warning("Paste some CV text or upload a file first.")
+            else:
+                with st.spinner("Reading your CV with the local LLM..."):
+                    prof = na.extract_cv_profile(text)
+                na.save_cv_profile(prof)
+                na.invalidate_current_week()   # newsletter depends on interests
+                st.success(f"Got it, {prof['name']}! Interests: "
+                           + ", ".join(prof["interests"] or ["—"]))
+                st.rerun()
+
+
 def render_profile_rail():
-    st.markdown(textwrap.dedent("""
+    profile = na.load_cv_profile()
+    name = (profile or {}).get("name") or "Guest"
+    initial = (name.strip()[:1] or "?").upper()
+    interests = (profile or {}).get("interests", [])
+    role = ", ".join(interests[:2]) if interests else "No CV added yet"
+
+    st.markdown(textwrap.dedent(f"""
     <div class="mf-rail-card">
-      <div class="mf-avatar">P</div>
-      <div class="mf-rail-name">Pedro</div>
-      <div class="mf-rail-role">Meta AI Engineer · RAG</div>
+      <div class="mf-avatar">{html.escape(initial)}</div>
+      <div class="mf-rail-name">{html.escape(name)}</div>
+      <div class="mf-rail-role">{html.escape(role)}</div>
     </div>
     """), unsafe_allow_html=True)
 
+    render_cv_form(profile)
+
     history = na.load_recent_history()
     current = na.peek_current_issue()
+
+    interests_line = ("Interests from your CV: " + ", ".join(interests) + "."
+                      if interests else
+                      "Add your CV to personalise the newsletter.")
     if history:
         top_cats = ", ".join(
             c for c, _ in Counter(
                 h["category"] for h in history if h.get("category")
             ).most_common(3))
-        stats_line = f"Baseado em {len(history)} pesquisas recentes: {top_cats}."
+        stats_line = f"Based on {len(history)} recent searches: {top_cats}."
     else:
-        stats_line = "Ainda sem pesquisas registadas nesta sessão local."
+        stats_line = "No searches logged in this local session yet."
     summary_line = (current["interest_summary"] if current else
-                    "Gera a newsletter para veres aqui o teu contexto "
-                    "compactado.")
+                    "Generate the newsletter to see your compacted context "
+                    "here.")
 
+    badge = "Active" if (interests or history) else "Getting started"
     st.markdown(textwrap.dedent(f"""
     <div class="mf-rail-card">
-      <span class="mf-badge">{'Ativo' if history else 'Em construção'}</span>
-      <div class="mf-rail-title">Contexto compactado</div>
-      <p class="mf-rail-text">{stats_line}</p>
-      <p class="mf-rail-text">{summary_line}</p>
+      <span class="mf-badge">{badge}</span>
+      <div class="mf-rail-title">Your profile</div>
+      <p class="mf-rail-text">{html.escape(interests_line)}</p>
+      <p class="mf-rail-text">{html.escape(stats_line)}</p>
+      <p class="mf-rail-text">{html.escape(summary_line)}</p>
     </div>
     """), unsafe_allow_html=True)
 
 
 def _generate_with_status(force=False):
-    with st.status("A preparar a tua newsletter (LLM local, pode demorar "
-                   "um pouco)...", expanded=True) as status:
-        issue = na.generate_weekly_newsletter(
-            force=force, progress=lambda msg: status.write(msg))
-        status.update(label="Newsletter pronta ✔", state="complete")
+    with st.status("Preparing your newsletter (local LLM, this may take a "
+                   "moment)...", expanded=True) as status:
+        try:
+            issue = na.generate_weekly_newsletter(
+                force=force, progress=lambda msg: status.write(msg))
+        except Exception as e:
+            status.update(label="Generation failed", state="error")
+            st.error(f"Couldn't build the newsletter right now: {e}\n\n"
+                     "arXiv may be rate-limiting requests — wait a minute and "
+                     "try again.")
+            return None
+        status.update(label="Newsletter ready ✔", state="complete")
     return issue
 
 
-def render_newsletter_feed():
-    issue = _generate_with_status()
-
+def _render_issue(issue):
+    """Display an already-generated newsletter issue (no generation here)."""
     st.markdown(textwrap.dedent(f"""
     <div class="mf-feed-hero">
-      <span class="mf-badge mf-badge-accent">Esta semana · {issue['week_label']}</span>
-      <h2>O que achámos importante para ti</h2>
-      <p class="mf-hero-preview">{issue['preview']}</p>
+      <span class="mf-badge mf-badge-accent">This week · {issue['week_label']}</span>
+      <h2>What we picked for you</h2>
+      <p class="mf-hero-preview">{html.escape(issue['preview'])}</p>
     </div>
     """), unsafe_allow_html=True)
 
     if issue.get("quality_flag"):
-        st.caption(f"⚠️ Nota de qualidade: {issue['quality_flag']}")
+        st.caption(f"⚠️ Quality note: {issue['quality_flag']}")
 
-    if st.button("🔄 Gerar novamente esta semana"):
-        _generate_with_status(force=True)
-        st.rerun()
+    if st.button("🔄 Regenerate this week"):
+        if _generate_with_status(force=True):
+            st.rerun()
 
-    st.markdown("**🔝 Top 10 para ti**")
+    st.markdown("**🔝 Top 10 for you**")
     for i, item in enumerate(issue["items"], start=1):
         c1, c2 = st.columns([5, 1], vertical_alignment="center")
         with c1:
             st.markdown(f"**{i}. {item['title']}**")
             if item.get("authors"):
                 st.caption(", ".join(item["authors"]))
-            st.caption(item["summary_pt"])
+            st.caption(item.get("summary", ""))
         with c2:
             if item.get("pdf_url"):
-                st.link_button("📄 Abrir PDF", item["pdf_url"],
+                st.link_button("📄 Open PDF", item["pdf_url"],
                                use_container_width=True)
             else:
-                st.button("📄 Abrir PDF", key=f"pdf_{i}", disabled=True,
+                st.button("📄 Open PDF", key=f"pdf_{i}", disabled=True,
                           use_container_width=True)
         st.divider()
 
-    st.markdown("**Edições anteriores**")
+
+def _render_past_issues():
+    st.markdown("**Past issues**")
     past_issues = na.list_past_issues()
     if not past_issues:
-        st.caption("Ainda não há edições anteriores — volta na próxima "
-                   "semana.")
+        st.caption("No past issues yet — check back next week.")
     for past in past_issues:
         n_items = len(past.get("items", []))
-        with st.expander(f"{past['week_label']} · {n_items} artigos"):
+        with st.expander(f"{past['week_label']} · {n_items} papers"):
             st.caption(past.get("preview", ""))
             for it in past.get("items", []):
-                st.markdown(f"- **{it['title']}** — {it['summary_pt']}")
+                st.markdown(f"- **{it['title']}** — {it.get('summary', '')}")
+
+
+def render_newsletter_main():
+    """Right-hand area. Never generates on load — waits for the user to press
+    the generate button. If this week's issue is already cached, it's shown."""
+    profile = na.load_cv_profile()
+    current = na.peek_current_issue()          # reads cache, no generation
+
+    if current is None:
+        name = (profile or {}).get("name") or ""
+        greeting = f"Ready when you are{', ' + name if name else ''}."
+        st.markdown(textwrap.dedent(f"""
+        <div class="mf-feed-hero">
+          <span class="mf-badge mf-badge-accent">Your weekly digest</span>
+          <h2>{html.escape(greeting)}</h2>
+          <p class="mf-hero-preview">We'll scan the latest arXiv papers and
+          curate a personalised top 10 based on your CV interests and recent
+          searches. Nothing runs until you press generate.</p>
+        </div>
+        """), unsafe_allow_html=True)
+
+        if profile is None:
+            st.info("👈 Add your CV on the left to personalise the digest — "
+                    "or generate one from your recent searches.")
+        else:
+            st.caption("Using the CV profile on the left. Update it anytime, "
+                       "then regenerate.")
+
+        if st.button("✨ Generate my newsletter", type="primary"):
+            if _generate_with_status(force=False):
+                st.rerun()
+    else:
+        _render_issue(current)
+
+    _render_past_issues()
 
 
 def render_newsletter():
     hide_sidebar()
     top_nav()
-    st.title("📰 MindFeed — Newsletter pessoal")
-    st.caption("A tua seleção semanal de investigação em RAG e IA aplicada — "
-              "gerada a partir do que pesquisas em Explorar tendências.")
+    st.title("📰 MindFeed — Personal newsletter")
+    st.caption("Your weekly research pick, generated from the interests in "
+               "your CV and what you search in Explore trends.")
 
-    main_col, side_col = st.columns([2.6, 1], gap="large")
-    with side_col:
+    left_col, main_col = st.columns([1, 2.6], gap="large")
+    with left_col:
         render_profile_rail()
     with main_col:
-        render_newsletter_feed()
+        render_newsletter_main()
 
 
 # ==========================================================================
@@ -563,7 +732,7 @@ def render_compare_years(subject_label, keyword, years, max_per_year):
 # ==========================================================================
 def render_search_app():
     top_nav()
-    st.title("🔍 MindFeed — Explorar tendências")
+    st.title("🔍 MindFeed — Explore trends")
 
     with st.sidebar:
         mode = st.radio("Mode", ["Latest trend", "Compare years"], index=0)

@@ -76,14 +76,24 @@ def _request_entries(params):
         except (requests.exceptions.Timeout,
                 requests.exceptions.ConnectionError,
                 requests.exceptions.HTTPError) as e:
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            # retry server-side (5xx) / network errors, re-raise client 4xx
-            if isinstance(e, requests.exceptions.HTTPError) and \
-                    status is not None and status < 500:
+            resp_obj = getattr(e, "response", None)
+            status = getattr(resp_obj, "status_code", None)
+            # Retry transient failures: network/timeouts, 5xx, and 429 (rate
+            # limit). Re-raise genuine client errors (other 4xx).
+            if isinstance(e, requests.exceptions.HTTPError) \
+                    and status is not None and status < 500 and status != 429:
                 raise
             last_err = e
             if attempt < SEARCH_RETRIES:
-                time.sleep(RETRY_BACKOFF)
+                wait = RETRY_BACKOFF
+                if status == 429:
+                    # honour Retry-After if present, else back off harder
+                    retry_after = (resp_obj.headers.get("Retry-After")
+                                   if resp_obj is not None else None)
+                    wait = (int(retry_after)
+                            if retry_after and str(retry_after).isdigit()
+                            else RETRY_BACKOFF * 3 * attempt)
+                time.sleep(wait)
     raise last_err
 
 
