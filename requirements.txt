@@ -10,6 +10,5 @@ spacy>=3.7             # named entity recognition
 transformers>=4.36,<5  # v5 removed the 'summarization' pipeline task we use
 torch>=2.0
 accelerate>=0.26       # efficient loading for the local newsletter LLM (Qwen2.5-1.5B-Instruct)
-pypdf>=4.0              # extracts text from uploaded CV PDFs (newsletter profile)
 # model wheel pinned to 3.8.0 (3.7.x forces spaCy <3.8, which has no Py3.13 wheels)
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
