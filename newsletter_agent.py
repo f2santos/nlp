@@ -1,41 +1,52 @@
 """
 newsletter_agent.py
 --------------------
-Agentic pipeline behind the "Newsletter pessoal" page: turns what the user
-searches in "Explore trends" into a personalised weekly digest, using a
-local instruction-tuned LLM (no paid API key — same "open models only"
-principle as the distilBART summariser in nlp_pipeline.py).
+Agentic pipeline behind the "Newsletter pessoal" page: builds a personalised
+weekly digest of arXiv papers with Claude (Anthropic API — needs an API key;
+the "Explore trends" side of the app keeps running on local open models).
+
+An issue can be built from two kinds of request:
+  • "profile"     — a short brief of the CV interests + recent searches
+  • "description" — whatever the user typed in "Describe what I want"
 
 Pipeline (deterministic multi-step, with a bounded quality-control loop):
 
-    compact_context -> plan_queries -> fetch_candidates -> select_top10
-        -> summarize_and_preview -> critique -> (refine, up to MAX_REFINE_LOOPS)
+    plan_request -> fetch_candidates -> discover_topics (clusters)
+        -> select_and_summarize -> basic checks
+        -> (retry the selection, up to MAX_REFINE_LOOPS)
 
-Results are cached per ISO week in data/newsletter_cache/, so the LLM and
-the arXiv API are only hit when the week changes or the user forces a
-regeneration — not on every page view.
+Every Claude call uses structured outputs: the reply is parsed straight into
+a pydantic model, so there is no JSON scraping or format-retry logic.
+
+Issues are cached per ISO week in data/newsletter_cache/, so Claude and the
+arXiv API are only hit when the user asks for a new issue — not on every page
+view.
 """
 
 import datetime
-import functools
 import json
 import re
 import time
 from collections import Counter
 from pathlib import Path
+from typing import Literal
+
+import anthropic
+from pydantic import BaseModel, ValidationError
 
 import arxiv_api
 import nlp_pipeline as nlp
 
-# Fast/light model for validating the workflow end-to-end on CPU. Same
-# family as Qwen2.5-1.5B-Instruct (identical chat template), ~3x smaller —
-# once the pipeline is confirmed working, swap this one constant to scale
-# up to "Qwen/Qwen2.5-1.5B-Instruct" (or larger) for better output quality.
-LLM_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+# Claude Haiku 4.5 is cheap and fast for trying things out; production sets
+# MINDFEED_CLAUDE_MODEL = "claude-sonnet-5" (read by app.py) to scale up.
+DEFAULT_MODEL = "claude-haiku-4-5"
+EFFORT = "medium"     # only sent to models that support it (Haiku 4.5 doesn't)
+MAX_TOKENS = 16000
 MAX_REFINE_LOOPS = 1
 TOP_N = 10
-MAX_CANDIDATES = 16  # hard cap on candidates fed to the LLM — keeps prompts
-                     # (and CPU prefill time) bounded regardless of query count
+MAX_QUERIES = 3
+PER_QUERY = 12
+MAX_CANDIDATES = 30   # papers shown to Claude when it picks the top 10
 
 DATA_DIR = Path(__file__).parent / "data"
 HISTORY_PATH = DATA_DIR / "search_history.jsonl"
@@ -44,7 +55,7 @@ CACHE_DIR = DATA_DIR / "newsletter_cache"
 MONTHS = ["", "January", "February", "March", "April", "May", "June",
           "July", "August", "September", "October", "November", "December"]
 
-# Bootstrap profile used only when there is no search history / CV yet, so the
+# Starter interests used when there is no CV or search history yet, so the
 # newsletter is never empty on first use.
 DEFAULT_PROFILE = {
     "categories": ["cs.CL", "cs.AI"],
@@ -63,62 +74,90 @@ def _dedup(seq):
 
 
 # ==========================================================================
-#  Local LLM — lazy singleton, chat-template prompting, JSON-tolerant parsing
+#  Claude — structured-output calls
 # ==========================================================================
-@functools.lru_cache(maxsize=1)
-def _load_llm():
-    from transformers import pipeline
-    # No device_map="auto" here: on this CPU-only machine, accelerate's
-    # automatic dispatch mis-estimates available memory and tries to
-    # disk-offload part of the model, which errors without an
-    # offload_folder. The model comfortably fits in RAM, so just load it
-    # straight onto the default (CPU) device.
-    return pipeline("text-generation", model=LLM_MODEL_NAME, dtype="auto")
+class NewsletterError(Exception):
+    """A failure worth showing to the user as-is (bad model reply, no papers
+    found, empty request...)."""
 
 
-def _try_parse_json(text):
-    match = re.search(r"\{.*\}|\[.*\]", text, re.DOTALL)
-    if not match:
-        return None
+# Restricting categories to our taxonomy in the schema means Claude can only
+# ever answer with codes the arXiv layer supports.
+Category = Literal[tuple(arxiv_api.CATEGORIES.values())]
+
+
+class CvProfile(BaseModel):
+    name: str
+    interests: list[str]
+    categories: list[Category]
+
+
+class Query(BaseModel):
+    category: Category
+    keyword: str
+
+
+class SearchPlan(BaseModel):
+    focus: str
+    queries: list[Query]
+    avoid: list[str]
+    interests: list[str]
+
+
+class Pick(BaseModel):
+    index: int
+    summary: str
+
+
+class Selection(BaseModel):
+    preview: str
+    picks: list[Pick]
+
+
+def _ask(client, model, system, user, schema):
+    """One Claude call whose reply is parsed into the pydantic `schema`."""
+    extra = {}
+    if not model.startswith("claude-haiku"):     # Haiku 4.5 rejects `effort`
+        extra["output_config"] = {"effort": EFFORT}
     try:
-        return json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
+        resp = client.messages.parse(
+            model=model, max_tokens=MAX_TOKENS, system=system,
+            messages=[{"role": "user", "content": user}],
+            output_format=schema, **extra,
+        )
+    except ValidationError as e:
+        # the SDK validates while parsing: a reply that doesn't fit the schema
+        # (refused, or cut off at max_tokens) surfaces here
+        raise NewsletterError("Claude's answer came back incomplete — please "
+                              "try again.") from e
+    if resp.stop_reason == "refusal" or resp.parsed_output is None:
+        raise NewsletterError("Claude couldn't handle this request — try "
+                              "rephrasing it.")
+    return resp.parsed_output
 
 
-def _chat(system, user, max_new_tokens=300, expect_json=False):
-    """Run one chat-formatted generation. If expect_json, try to parse the
-    output as JSON, with one corrective retry if parsing fails — this retry
-    is the module's cheapest, most common form of self-correction."""
-    gen = _load_llm()
-    tok = gen.tokenizer
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": user}]
-    prompt = tok.apply_chat_template(messages, tokenize=False,
-                                     add_generation_prompt=True)
-    out = gen(prompt, max_new_tokens=max_new_tokens, do_sample=False,
-              return_full_text=False, pad_token_id=tok.eos_token_id)
-    text = out[0]["generated_text"].strip()
-    if not expect_json:
-        return text
-
-    data = _try_parse_json(text)
-    if data is not None:
-        return data
-
-    messages.append({"role": "assistant", "content": text})
-    messages.append({"role": "user", "content": (
-        f"Your previous answer was not valid JSON:\n{text}\n\n"
-        "Reply ONLY with valid JSON, no surrounding text.")})
-    prompt2 = tok.apply_chat_template(messages, tokenize=False,
-                                      add_generation_prompt=True)
-    out2 = gen(prompt2, max_new_tokens=max_new_tokens, do_sample=False,
-               return_full_text=False, pad_token_id=tok.eos_token_id)
-    return _try_parse_json(out2[0]["generated_text"].strip())
+def friendly_error(exc):
+    """Short, user-facing explanation of a failed Claude/arXiv step."""
+    if isinstance(exc, NewsletterError):
+        return str(exc)
+    if isinstance(exc, anthropic.AuthenticationError):
+        return "The Anthropic API key was rejected — check ANTHROPIC_API_KEY."
+    if isinstance(exc, (anthropic.PermissionDeniedError,
+                        anthropic.NotFoundError)):
+        return ("This API key can't use the configured model — check "
+                "MINDFEED_CLAUDE_MODEL.")
+    if isinstance(exc, anthropic.RateLimitError):
+        return "Claude is rate-limiting requests — wait a minute and try again."
+    if isinstance(exc, anthropic.APIConnectionError):
+        return "Couldn't reach the Claude API — check your internet connection."
+    if isinstance(exc, anthropic.APIStatusError):
+        return (f"The Claude API returned an error ({exc.status_code}) — try "
+                "again shortly.")
+    return f"Something went wrong: {exc}"
 
 
 # ==========================================================================
-#  Search history — what feeds the compacted context
+#  Search history — one of the two sources of the profile brief
 # ==========================================================================
 def record_search(subject_label, category, keyword, mode):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -150,12 +189,12 @@ def load_recent_history(days=30):
 
 
 # ==========================================================================
-#  CV profile — extract the user's name + research interests from a pasted CV
+#  CV profile — the user's name + research interests, read from a CV by Claude
 # ==========================================================================
 CV_PROFILE_PATH = DATA_DIR / "cv_profile.json"
 
 # Best-effort mapping from free-text interests to the arXiv category codes we
-# support. First matching hint wins per category.
+# support — a fallback for when Claude returns no categories for a CV.
 _INTEREST_CATEGORY_HINTS = [
     ("cs.CL", ("nlp", "natural language", "language", "linguistic",
                "translation", "text mining", "retrieval", "rag",
@@ -205,8 +244,8 @@ def _shorten_term(term):
 
 
 def _guess_name_fallback(cv_text):
-    """Heuristic used when the LLM fails to return a name: a CV's name is
-    usually the first short, capitalised, digit/@-free line at the top."""
+    """Heuristic used when Claude returns no name: a CV's name is usually the
+    first short, capitalised, digit/@-free line at the top."""
     lines = [ln.strip() for ln in cv_text.splitlines()[:15] if ln.strip()]
     for ln in lines:
         words = ln.split()
@@ -217,39 +256,33 @@ def _guess_name_fallback(cv_text):
     return lines[0][:40] if lines else ""
 
 
-def extract_cv_profile(cv_text):
+def extract_cv_profile(cv_text, *, client, model):
     """
-    Extract the person's name and research interests from pasted CV text, using
-    the local LLM with a deterministic fallback. Interests are also mapped to
-    arXiv categories, which is what drives the personalised newsletter.
-    Returns {name, interests: [...], categories: [...]} or None for empty input.
+    Extract the person's name, research interests and matching arXiv
+    categories from CV text with Claude, with deterministic fallbacks.
+    Returns {name, interests, keywords, categories} or None for empty input.
     """
     cv_text = (cv_text or "").strip()
     if not cv_text:
         return None
-    result = _chat(
-        system=("You extract structured information from CVs / resumes. You "
-                "reply ONLY with valid JSON, no surrounding text."),
-        user=(f"Here is the text of a CV:\n\n{cv_text[:4000]}\n\n"
+    result = _ask(
+        client, model,
+        system="You extract structured information from CVs / resumes.",
+        user=(f"<cv>\n{cv_text}\n</cv>\n\n"
               "Extract: (1) the person's full name; (2) 3 to 6 research "
-              "interests or technical topics they focus on. Reply ONLY with "
-              'JSON: {"name": "...", "interests": ["...", "..."]}.'),
-        max_new_tokens=200, expect_json=True,
+              "interests or technical topics they focus on, as short phrases; "
+              "(3) the 1 to 3 arXiv categories that best match those "
+              "interests."),
+        schema=CvProfile,
     )
-    name, interests = "", []
-    if isinstance(result, dict):
-        name = str(result.get("name") or "").strip()
-        raw = result.get("interests")
-        if isinstance(raw, list):
-            interests = [str(x).strip() for x in raw if str(x).strip()]
-    if not name:
-        name = _guess_name_fallback(cv_text)
-    interests = interests[:6]
+    name = result.name.strip() or _guess_name_fallback(cv_text)
+    interests = [i.strip() for i in result.interests if i.strip()][:6]
+    categories = _dedup(result.categories)[:3] \
+        or _map_interests_to_categories(interests)
     # short, searchable keywords derived from the (possibly long) interests
-    keywords = _dedup(_shorten_term(i) for i in interests)
     return {"name": name or "Reader", "interests": interests,
-            "keywords": keywords,
-            "categories": _map_interests_to_categories(interests)}
+            "keywords": _dedup(_shorten_term(i) for i in interests),
+            "categories": categories}
 
 
 def save_cv_profile(profile):
@@ -271,6 +304,23 @@ def clear_cv_profile():
     CV_PROFILE_PATH.unlink(missing_ok=True)
 
 
+def merge_into_profile(interests, categories):
+    """Add interests (plus their short keywords) and categories to the saved
+    profile, creating one if needed — backs "Save as my preferences". The
+    current issue is kept: it was built from these very preferences."""
+    profile = load_cv_profile() or {"name": "", "interests": [],
+                                    "keywords": [], "categories": []}
+    interests = [i.strip() for i in interests if i and i.strip()]
+    valid = set(arxiv_api.CATEGORIES.values())
+    profile["interests"] = _dedup(profile.get("interests", []) + interests)
+    profile["keywords"] = _dedup(profile.get("keywords", [])
+                                 + [_shorten_term(i) for i in interests])
+    profile["categories"] = _dedup(profile.get("categories", [])
+                                   + [c for c in categories if c in valid])
+    save_cv_profile(profile)
+    return profile
+
+
 def invalidate_current_week():
     """Drop this week's cached issue so the next view regenerates it (used when
     the CV profile changes, since it feeds the newsletter)."""
@@ -278,105 +328,109 @@ def invalidate_current_week():
 
 
 # ==========================================================================
-#  Step 1 — compact context (search history + CV interests)
+#  Step 0 — the request: a profile brief, or the user's own description
 # ==========================================================================
-def compact_context(history, cv_profile=None):
+def profile_brief(history, cv_profile=None):
+    """Plain-text brief of the CV profile + recent searches: what Claude plans
+    the issue from in "From my profile" mode."""
     cv_profile = cv_profile or {}
     cv_name = (cv_profile.get("name") or "").strip()
     cv_interests = [i for i in cv_profile.get("interests", []) if i]
     cv_categories = [c for c in cv_profile.get("categories", []) if c]
-    # short search keywords (fall back to interests for older saved profiles)
-    cv_keywords = [k for k in cv_profile.get("keywords", []) if k] \
-        or [_shorten_term(i) for i in cv_interests]
+
+    if not history and not cv_interests and not cv_name:
+        return ("No CV or searches yet — suggest starter picks in applied AI "
+                "and NLP (categories "
+                + ", ".join(DEFAULT_PROFILE["categories"]) + "; e.g. "
+                + DEFAULT_PROFILE["keywords"][0] + ").")
 
     cat_counts = Counter(h["category"] for h in history if h.get("category"))
     kw_counts = Counter(h["keyword"] for h in history if h.get("keyword"))
     hist_categories = [c for c, _ in cat_counts.most_common(3)]
     hist_keywords = [k for k, _ in kw_counts.most_common(3)]
 
-    # CV categories/keywords take priority, then recent search history.
-    top_categories = _dedup(cv_categories + hist_categories)[:3] \
-        or list(DEFAULT_PROFILE["categories"])
-    top_keywords = _dedup(cv_keywords + hist_keywords)[:4] \
-        or list(DEFAULT_PROFILE["keywords"])
-
-    if not history and not cv_interests and not cv_name:
-        return {
-            "summary": ("No searches or CV yet — showing starter suggestions "
-                        "aligned with applied AI and NLP."),
-            "top_categories": DEFAULT_PROFILE["categories"],
-            "top_keywords": DEFAULT_PROFILE["keywords"],
-            "n_searches": 0, "name": "",
-        }
-
     parts = []
     if cv_name:
-        parts.append(f"User: {cv_name}.")
+        parts.append(f"Reader: {cv_name}.")
     if cv_interests:
-        parts.append("Research interests (from CV): "
+        parts.append("Research interests (from their CV): "
                      + ", ".join(cv_interests) + ".")
+    if cv_categories:
+        parts.append("CV categories: " + ", ".join(cv_categories) + ".")
     if history:
-        parts.append(f"{len(history)} recent searches. Top categories: "
-                     + ", ".join(hist_categories) + "."
+        parts.append(f"{len(history)} searches in the last 30 days. Most "
+                     "searched categories: " + ", ".join(hist_categories) + "."
                      + (f" Keywords: {', '.join(hist_keywords)}."
                         if hist_keywords else ""))
-    stats_text = " ".join(parts)
+    if cv_interests and history:
+        parts.append("Weigh the CV interests above the search history.")
+    return " ".join(parts)
 
-    summary = _chat(
-        system=("You summarise a person's research interests in 1-2 short, "
-                "natural English sentences, with no preamble like 'Here is'."),
-        user=(f"A user's profile:\n{stats_text}\n\n"
-              "Write a short (1-2 sentence) summary of what this person seems "
-              "to be researching or interested in lately."),
-        max_new_tokens=100,
-    )
-    return {"summary": (summary or "").strip() or stats_text,
-            "top_categories": top_categories, "top_keywords": top_keywords,
-            "n_searches": len(history), "name": cv_name}
+
+def _request_block(request_text, source, adjustments=(), previous_titles=()):
+    """The reader's request as Claude sees it in every step, including any
+    "Refine" adjustments made after earlier issues."""
+    kind = ("a summary of the reader's profile (CV interests and recent "
+            "searches)" if source == "profile" else
+            "the reader's own description of what they want to read")
+    parts = [f"The request below is {kind}.",
+             f"<request>\n{request_text}\n</request>"]
+    if adjustments:
+        parts.append("After seeing an earlier issue, the reader asked for "
+                     "these changes (most recent last) — they take priority "
+                     "over the request:\n"
+                     + "\n".join(f"- {a}" for a in adjustments))
+    if previous_titles:
+        parts.append("Papers in the previous issue (only repeat one if it is "
+                     "still clearly among the best fits):\n"
+                     + "\n".join(f"- {t}" for t in previous_titles))
+    return "\n\n".join(parts)
 
 
 # ==========================================================================
-#  Step 2 — plan arXiv queries
+#  Step 1 — plan the arXiv searches
 # ==========================================================================
-def _sanitize_queries(result, context):
-    valid_categories = set(arxiv_api.CATEGORIES.values())
-    queries = []
-    if isinstance(result, list):
-        for item in result:
-            if not isinstance(item, dict):
-                continue
-            cat = item.get("category")
-            if cat in valid_categories:
-                queries.append({"category": cat,
-                               "keyword": (item.get("keyword") or "").strip()})
-    if not queries:
-        cats = context["top_categories"] or DEFAULT_PROFILE["categories"]
-        kw = (context["top_keywords"][0] if context["top_keywords"]
-             else DEFAULT_PROFILE["keywords"][0])
-        queries = [{"category": c, "keyword": kw} for c in cats[:2]]
-    return queries[:3]
-
-
-def plan_queries(context):
-    user_prompt = (
-        f"User context: {context['summary']}\n"
-        f"Most-searched categories: "
-        f"{', '.join(context['top_categories']) or 'none'}\n"
-        f"Keywords: {', '.join(context['top_keywords']) or 'none'}\n"
-        f"Valid arXiv categories: {', '.join(arxiv_api.CATEGORIES.values())}\n\n"
-        "Suggest 1 to 3 arXiv searches to find the most relevant papers for "
-        "this user this week. Reply ONLY with JSON: a list of objects "
-        '{"category": "<valid arXiv code>", "keyword": "<keyword or empty>"}.'
+def plan_request(request, *, client, model):
+    categories = "\n".join(f"- {label}" for label in arxiv_api.CATEGORIES)
+    return _ask(
+        client, model,
+        system=("You plan the arXiv searches for a personalised weekly "
+                "research newsletter."),
+        user=(f"{request}\n\n"
+              "Plan this week's issue:\n"
+              "- focus: one or two sentences on what this reader wants to "
+              "read about.\n"
+              "- queries: 1 to 3 arXiv searches. Each has one category from "
+              "the list below and a keyword of 1-3 words, or an empty "
+              "keyword to take the newest papers of the whole category. "
+              "Keywords are matched against the paper text, multi-word ones "
+              "as an exact phrase, so keep them short and common (e.g. "
+              "\"retrieval augmented\", not \"retrieval-augmented generation "
+              "for clinical question answering\").\n"
+              "- avoid: topics the reader said they don't want (empty if "
+              "none).\n"
+              "- interests: 3 to 6 short phrases describing the reader's "
+              "interests, suitable for saving in their profile.\n\n"
+              f"arXiv categories:\n{categories}"),
+        schema=SearchPlan,
     )
-    result = _chat(
-        system=("You are a research assistant that decides which arXiv "
-                "searches to run to satisfy a user's interests."),
-        user=user_prompt, max_new_tokens=120, expect_json=True,
-    )
-    return _sanitize_queries(result, context)
 
 
-def fetch_candidates(queries, per_query=8):
+def _clean_queries(plan):
+    queries, seen = [], set()
+    for q in plan.queries:
+        keyword = " ".join(q.keyword.split()[:3])
+        if (q.category, keyword) not in seen:
+            seen.add((q.category, keyword))
+            queries.append({"category": q.category, "keyword": keyword})
+    return queries[:MAX_QUERIES] or [
+        {"category": c, "keyword": ""} for c in DEFAULT_PROFILE["categories"]]
+
+
+# ==========================================================================
+#  Step 2 — fetch candidates from arXiv
+# ==========================================================================
+def fetch_candidates(queries, per_query=PER_QUERY):
     seen = set()
     candidates = []
     for i, q in enumerate(queries):
@@ -399,8 +453,14 @@ def fetch_candidates(queries, per_query=8):
     return candidates[:MAX_CANDIDATES]
 
 
+def _merge_candidates(first, more):
+    seen = {d.get("link") or d.get("title") for d in first}
+    extra = [d for d in more if (d.get("link") or d.get("title")) not in seen]
+    return (first + extra)[:MAX_CANDIDATES]
+
+
 # ==========================================================================
-#  Step 3 — select top 10 (topic clustering + LLM judgment for diversity)
+#  Step 3 — pick the top 10 + write the summaries (one Claude call)
 # ==========================================================================
 def _sanitize_indices(result, n_candidates, n):
     idx = []
@@ -417,97 +477,51 @@ def _sanitize_indices(result, n_candidates, n):
     return idx[:n]
 
 
-def select_top10(candidates, context, n=TOP_N):
-    if len(candidates) <= n:
-        return candidates
+def _fallback_summary(doc):
+    return doc["abstract"][:180].rsplit(" ", 1)[0] + "…"
 
-    n_clusters = min(5, max(2, len(candidates) // 10))
-    try:
-        nlp.discover_topics(candidates, n_topics=n_clusters, method="kmeans")
-    except Exception:
-        for d in candidates:
-            d.setdefault("topic", -1)
+
+def select_and_summarize(request, plan, candidates, cluster_labels, n, *,
+                         client, model, issues=None):
+    def excerpt(text, limit=500):
+        return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
 
     listing = "\n".join(
-        f"{i}. [cluster {d.get('topic', -1)}] {d['title']} — "
-        f"{d['abstract'][:100]}"
+        f"{i}. [cluster: {cluster_labels.get(d.get('topic', -1), 'misc')}] "
+        f"{d['title']} — {excerpt(d['abstract'])}"
         for i, d in enumerate(candidates)
     )
-    user_prompt = (
-        f"User context: {context['summary']}\n\n"
-        f"Candidates (numbered, grouped by sub-topic cluster):\n"
-        f"{listing}\n\n"
-        f"Pick the {n} most relevant AND diverse ones (try to cover several "
-        "clusters, not just the biggest). Reply ONLY with JSON: a list of the "
-        "chosen indices, e.g. [0, 3, 7, ...]."
+    retry_note = ("\n\nYour previous selection had these problems — fix "
+                  "them:\n" + "\n".join(f"- {x}" for x in issues)
+                  if issues else "")
+    return _ask(
+        client, model,
+        system=("You are the editor of a personalised research newsletter. "
+                "Pick papers faithfully to the reader's request and summarise "
+                "them accurately — never claim anything the abstract doesn't "
+                "say."),
+        user=(f"{request}\n\n"
+              f"What the reader wants: {plan.focus}\n"
+              f"Topics to avoid: {', '.join(plan.avoid) or 'none'}\n\n"
+              "Candidate papers (numbered; papers in the same cluster share "
+              f"a sub-topic):\n<candidates>\n{listing}\n</candidates>\n\n"
+              f"Choose the {n} papers that best fit the request: relevance "
+              "first, then variety across clusters. Skip papers on the avoid "
+              "list. For each pick give its index and a one-sentence summary "
+              "in English of what the paper contributes — specific, faithful "
+              "to the abstract, without repeating the title. Also write a 1-2 "
+              "sentence preview of this issue's highlights." + retry_note),
+        schema=Selection,
     )
-    result = _chat(
-        system=("You are a newsletter editor selecting the best scientific "
-                "papers for a user, balancing relevance and topic diversity."),
-        user=user_prompt, max_new_tokens=100, expect_json=True,
-    )
-    indices = _sanitize_indices(result, len(candidates), n)
-    return [candidates[i] for i in indices]
 
 
 # ==========================================================================
-#  Step 4 — summaries + weekly preview (one batched LLM call)
+#  Step 4 — quality control (deterministic checks)
 # ==========================================================================
-def _sanitize_summaries(result, selected):
-    fallback_preview = ("This week's selection covers the topics you've been "
-                        "exploring the most.")
-    fallback_summaries = [d["abstract"][:180].rsplit(" ", 1)[0] + "…"
-                          for d in selected]
-    if not isinstance(result, dict):
-        return fallback_preview, fallback_summaries
-    preview = result.get("preview") or fallback_preview
-    summaries = result.get("summaries")
-    if not isinstance(summaries, list) or len(summaries) != len(selected):
-        summaries = fallback_summaries
-    else:
-        summaries = [s if isinstance(s, str) and s.strip() else fb
-                     for s, fb in zip(summaries, fallback_summaries)]
-    return preview, summaries
-
-
-def summarize_and_preview(selected, context):
-    listing = "\n".join(
-        f"{i}. {d['title']} — {d['abstract'][:180]}"
-        for i, d in enumerate(selected)
-    )
-    user_prompt = (
-        f"User context: {context['summary']}\n\n"
-        f"Selected papers ({len(selected)} total):\n{listing}\n\n"
-        "For each paper, write a single short, clear, specific one-sentence "
-        "summary in English (do not repeat the title). Also write a short "
-        "preview paragraph (1-2 sentences) about this week's highlights.\n\n"
-        "Reply ONLY with valid JSON. FORMAT example (always invent new "
-        "content — never copy this example):\n"
-        '{"preview": "This week features new hybrid retrieval methods and '
-        'agents for scientific tasks.", "summaries": '
-        '["This paper proposes a technique that cuts indexing cost in large '
-        'vector databases.", "This work shows that multi-step agents '
-        'outperform single-step approaches on complex tasks."]}\n\n'
-        f'Your "summaries" list must have exactly {len(selected)} elements — '
-        "one per paper, in the same order as the list above."
-    )
-    result = _chat(
-        system=("You are a science newsletter editor who writes short, clear "
-                "summaries that stay faithful to the original content, in "
-                "English."),
-        user=user_prompt, max_new_tokens=480, expect_json=True,
-    )
-    return _sanitize_summaries(result, selected)
-
-
-# ==========================================================================
-#  Step 5 — quality-control critique
-# ==========================================================================
-def critique(draft):
-    items = draft["items"]
+def _basic_issues(items, expected):
     issues = []
-    if len(items) != TOP_N:
-        issues.append(f"expected {TOP_N} items, found {len(items)}")
+    if len(items) != expected:
+        issues.append(f"expected {expected} items, found {len(items)}")
     titles = [it["title"] for it in items]
     if len(set(titles)) != len(titles):
         issues.append("duplicate titles present")
@@ -515,31 +529,20 @@ def critique(draft):
         summ = (it.get("summary") or "").strip()
         if len(summ) < 15 or summ.lower() in it["title"].lower():
             issues.append(f"weak/repeated summary for: {it['title'][:60]}")
+    return issues
 
-    if issues:
-        return {"ok": False, "issues": issues}
 
-    listing = "\n".join(f"- {it['title']}: {it['summary']}" for it in items)
-    user_prompt = (
-        f"Preview: {draft['preview']}\n\nItems:\n{listing}\n\n"
-        "Evaluate this newsletter: are the items relevant and diverse from "
-        "each other? Are the summaries specific and useful? Reply ONLY with "
-        'JSON. If all good: {"ok": true, "issues": []}. If there are '
-        'problems, describe them: {"ok": false, "issues": ["summary 3 is '
-        'vague", "item 7 does not seem relevant"]}.'
-    )
-    result = _chat(
-        system="You are a demanding critic of science newsletters.",
-        user=user_prompt, max_new_tokens=120, expect_json=True,
-    )
-    if isinstance(result, dict) and "ok" in result:
-        return {"ok": bool(result["ok"]), "issues": result.get("issues") or []}
-    # critic itself failed to produce usable JSON — don't block forever
-    return {"ok": True, "issues": []}
+def _make_items(selected, summaries):
+    return [
+        {"title": d["title"], "authors": d["authors"][:4], "summary": s,
+         "arxiv_id": d["link"].rsplit("/", 1)[-1] if d.get("link") else "",
+         "link": d["link"], "pdf_url": d["pdf_url"]}
+        for d, s in zip(selected, summaries)
+    ]
 
 
 # ==========================================================================
-#  Orchestrator — cache-aware, with the bounded refine loop
+#  Orchestrator — build (or refine) this week's issue
 # ==========================================================================
 def _iso_week_key(d=None):
     d = d or datetime.date.today()
@@ -557,77 +560,112 @@ def week_range_label(d=None):
             f"{MONTHS[sunday.month]} {sunday.day}")
 
 
-def _build_draft(context, week_key, attempt, progress=None):
+def _save_issue(issue):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    (CACHE_DIR / f"{issue['week_key']}.json").write_text(
+        json.dumps(issue, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_issue(request_text, *, source, client, model, adjustments=(),
+                previous_titles=(), progress=None):
+    """
+    Build this week's issue with Claude and cache it. `source` is "profile"
+    (request_text = profile_brief(...)) or "description" (the user's own
+    words). `progress`, if given, is called with a short status string before
+    each stage so the UI can show step-by-step feedback.
+    """
     def step(msg):
         if progress:
             progress(msg)
 
-    step("Planning arXiv searches from your context...")
-    queries = plan_queries(context)
+    request_text = (request_text or "").strip()
+    if not request_text:
+        raise NewsletterError("Describe what you'd like to read first.")
+    adjustments = list(adjustments)
+    request = _request_block(request_text, source, adjustments,
+                             previous_titles)
 
-    step(f"Searching arXiv for candidates ({', '.join(q['category'] for q in queries)})...")
+    step("Understanding your request...")
+    plan = plan_request(request, client=client, model=model)
+    queries = _clean_queries(plan)
+
+    step("Searching arXiv ("
+         + ", ".join(f"{q['category']}" + (f" · {q['keyword']}"
+                                            if q["keyword"] else "")
+                     for q in queries) + ")...")
     candidates = fetch_candidates(queries)
+    if len(candidates) < TOP_N:
+        step("Few matches — broadening the search...")
+        time.sleep(3)   # arXiv rate limit
+        broader = [{"category": c, "keyword": ""}
+                   for c in _dedup(q["category"] for q in queries)]
+        candidates = _merge_candidates(candidates, fetch_candidates(broader))
     if not candidates:
-        queries = [{"category": c, "keyword": ""}
-                  for c in DEFAULT_PROFILE["categories"]]
-        candidates = fetch_candidates(queries)
+        raise NewsletterError("arXiv returned no papers — it may be "
+                              "rate-limiting requests. Wait a minute and try "
+                              "again.")
 
-    step(f"Selecting the {TOP_N} most relevant and diverse "
-        f"({len(candidates)} candidates)...")
-    selected = select_top10(candidates, context)
+    step(f"Grouping {len(candidates)} candidates by sub-topic...")
+    try:
+        topics = nlp.discover_topics(
+            candidates, n_topics=min(5, max(2, len(candidates) // 6)),
+            method="kmeans")
+    except Exception:
+        topics = []
+    cluster_labels = {t["id"]: t["label"] for t in topics}
 
-    step("Writing summaries and this week's preview...")
-    preview, summaries = summarize_and_preview(selected, context)
-    items = [
-        {"title": d["title"], "authors": d["authors"][:4], "summary": s,
-         "arxiv_id": d["link"].rsplit("/", 1)[-1] if d.get("link") else "",
-         "link": d["link"], "pdf_url": d["pdf_url"]}
-        for d, s in zip(selected, summaries)
-    ]
-    return {"week_key": week_key, "week_label": week_range_label(),
-           "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
-           "interest_summary": context["summary"], "preview": preview,
-           "items": items, "queries_used": queries,
-           "refine_iterations": attempt}
-
-
-def generate_weekly_newsletter(force=False, progress=None):
-    """progress, if given, is called with a short Portuguese status string
-    before each pipeline stage — lets the UI show real step-by-step
-    feedback instead of an opaque spinner during the (rare) 1-2 min a full
-    generation takes."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    week_key = _iso_week_key()
-    cache_path = CACHE_DIR / f"{week_key}.json"
-    if cache_path.exists() and not force:
-        return json.loads(cache_path.read_text(encoding="utf-8"))
-
-    if progress:
-        progress("Compacting your context (searches + CV)...")
-    context = compact_context(load_recent_history(), load_cv_profile())
-
-    draft = None
+    n = min(TOP_N, len(candidates))
+    issues = []
     for attempt in range(MAX_REFINE_LOOPS + 1):
-        draft = _build_draft(context, week_key, attempt, progress=progress)
-        if progress:
-            progress("Reviewing the quality of the selection...")
-        result = critique(draft)
-        if result["ok"]:
-            draft["quality_flag"] = None
+        step("Picking the best papers and writing summaries..." if not attempt
+             else "Quality check failed — refining the selection...")
+        selection = select_and_summarize(
+            request, plan, candidates, cluster_labels, n,
+            client=client, model=model, issues=issues)
+        indices = _sanitize_indices([p.index for p in selection.picks],
+                                    len(candidates), n)
+        by_index = {p.index: p.summary.strip() for p in selection.picks}
+        selected = [candidates[i] for i in indices]
+        items = _make_items(selected, [by_index.get(i)
+                                       or _fallback_summary(candidates[i])
+                                       for i in indices])
+        issues = _basic_issues(items, n)
+        if not issues:
             break
-        draft["quality_flag"] = "; ".join(result["issues"]) \
-            or "quality not confirmed"
-        if progress and attempt < MAX_REFINE_LOOPS:
-            progress("Quality insufficient — refining the selection...")
 
-    cache_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2),
-                          encoding="utf-8")
-    return draft
+    issue = {
+        "week_key": _iso_week_key(), "week_label": week_range_label(),
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "interest_summary": plan.focus.strip() or request_text[:200],
+        "preview": selection.preview.strip()
+        or "This week's selection, picked for you.",
+        "items": items, "queries_used": queries, "refine_iterations": attempt,
+        "quality_flag": "; ".join(issues) or None,
+        "source": source, "request": request_text, "adjustments": adjustments,
+        "engine": model,
+        "plan_interests": _dedup(i.strip() for i in plan.interests)[:6],
+        "plan_categories": _dedup(q["category"] for q in queries),
+    }
+    _save_issue(issue)
+    return issue
+
+
+def refine_issue(issue, adjustment, *, client, model, progress=None):
+    """Rebuild an issue with one more user adjustment ("more benchmarks, no
+    surveys"), keeping its original request and previous picks in view."""
+    adjustment = (adjustment or "").strip()
+    if not adjustment:
+        raise NewsletterError("Say what you'd like to change first.")
+    return build_issue(
+        issue["request"], source=issue.get("source", "description"),
+        adjustments=list(issue.get("adjustments", [])) + [adjustment],
+        previous_titles=[it["title"] for it in issue.get("items", [])],
+        client=client, model=model, progress=progress)
 
 
 def peek_current_issue():
     """Read the current week's cached issue without triggering generation —
-    used by the sidebar so just viewing it never calls the LLM."""
+    used by the page so just viewing it never calls Claude."""
     cache_path = CACHE_DIR / f"{_iso_week_key()}.json"
     if not cache_path.exists():
         return None

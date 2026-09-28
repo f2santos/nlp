@@ -8,7 +8,8 @@ The landing page routes to two areas:
   • Search      — the trend-analysis tool (latest trend + compare years):
                   keywords, topic discovery, NER, summary, trend report,
                   radar chart.
-  • Newsletter  — placeholder for a personalised digest (coming soon).
+  • Newsletter  — a personalised weekly digest built by Claude, either from
+                  the user's profile (CV + searches) or from a description.
 
 Run locally:   streamlit run app.py
 """
@@ -16,9 +17,11 @@ Run locally:   streamlit run app.py
 import datetime
 import html
 import io
+import os
 import textwrap
 from collections import Counter
 
+import anthropic
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as pgo
@@ -161,6 +164,7 @@ def inject_css():
       }
       .mf-feed-hero h2 { margin: .5rem 0 .6rem 0; font-size: 1.6rem; }
       .mf-hero-preview { color: var(--muted); font-size: .98rem; line-height: 1.6; margin: 0; }
+      .mf-hero-source { color: #8A7F70; font-size: .84rem; margin: .8rem 0 0 0; }
     </style>
     """), unsafe_allow_html=True)
 
@@ -223,9 +227,9 @@ def render_landing():
             <div class="mf-card">
               <div class="mf-icon">✉️</div>
               <h3>Personal newsletter</h3>
-              <p>A weekly digest tailored to you, built from the interests in
-              your CV and what you search — curated and summarised by a local
-              language model.</p>
+              <p>A weekly digest tailored to you — built from your CV and
+              searches, or from whatever you describe — curated and summarised
+              by Claude.</p>
             </div>
             """), unsafe_allow_html=True)
             if st.button("Set up my feed →", type="primary",
@@ -237,17 +241,50 @@ def render_landing():
         <div class="mf-strip">
           <div class="mf-chip"><span>📡</span> Real arXiv data</div>
           <div class="mf-chip"><span>🧩</span> Full NLP pipeline</div>
-          <div class="mf-chip"><span>🔒</span> Local models · no API key</div>
-          <div class="mf-chip"><span>✨</span> Personalised to you</div>
+          <div class="mf-chip"><span>🔒</span> Local NLP models</div>
+          <div class="mf-chip"><span>✨</span> Personalised by Claude</div>
         </div>
-        <div class="mf-footer">Real data via the arXiv API · Open-source
-        models, no cost · Built for the Applied NLP project</div>
+        <div class="mf-footer">Real data via the arXiv API · Open-source NLP
+        models · Newsletter by Claude · Built for the Applied NLP project</div>
         """), unsafe_allow_html=True)
 
 
 # ==========================================================================
 #  Newsletter — personal dashboard, backed by the newsletter_agent pipeline
 # ==========================================================================
+MODEL_NAMES = {"claude-haiku-4-5": "Claude Haiku 4.5",
+               "claude-sonnet-5": "Claude Sonnet 5"}
+
+
+def _secret(name):
+    """A setting from .streamlit/secrets.toml, falling back to the
+    environment (st.secrets raises when there is no secrets file)."""
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    return value or os.environ.get(name)
+
+
+@st.cache_resource
+def _claude_client(api_key):
+    return anthropic.Anthropic(api_key=api_key, timeout=120.0)
+
+
+def _claude():
+    """{"client", "model"} for the newsletter's Claude calls, or None when no
+    API key is configured (the newsletter then can't generate)."""
+    api_key = _secret("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    return {"client": _claude_client(api_key),
+            "model": _secret("MINDFEED_CLAUDE_MODEL") or na.DEFAULT_MODEL}
+
+
+def _model_name(model):
+    return MODEL_NAMES.get(model, model)
+
+
 def _read_cv_upload(uploaded):
     """Return plain text from an uploaded CV file (.txt / .md / .pdf)."""
     if uploaded is None:
@@ -263,9 +300,9 @@ def _read_cv_upload(uploaded):
     return data.decode("utf-8", errors="ignore")
 
 
-def render_cv_form(profile):
-    """CV input area: paste text or upload a file; extract name + interests
-    (which drive the personalised newsletter)."""
+def render_cv_form(profile, llm):
+    """CV input area: paste text or upload a file; Claude extracts name +
+    interests (which drive the personalised newsletter)."""
     with st.expander("📄 " + ("Update my CV" if profile else "Add my CV"),
                      expanded=not profile):
         cv_text = st.text_area(
@@ -275,7 +312,7 @@ def render_cv_form(profile):
         uploaded = st.file_uploader("…or upload a file (PDF / TXT)",
                                     type=["pdf", "txt", "md"], key="cv_file")
         c1, c2 = st.columns(2)
-        analyse = c1.button("Analyse CV", type="primary",
+        analyse = c1.button("Analyse CV", type="primary", disabled=not llm,
                             use_container_width=True, key="cv_analyse")
         if profile and c2.button("Remove", use_container_width=True,
                                  key="cv_clear"):
@@ -288,8 +325,12 @@ def render_cv_form(profile):
             if not text.strip():
                 st.warning("Paste some CV text or upload a file first.")
             else:
-                with st.spinner("Reading your CV with the local LLM..."):
-                    prof = na.extract_cv_profile(text)
+                with st.spinner("Reading your CV with Claude..."):
+                    try:
+                        prof = na.extract_cv_profile(text, **llm)
+                    except Exception as e:
+                        st.error(na.friendly_error(e))
+                        return
                 na.save_cv_profile(prof)
                 na.invalidate_current_week()   # newsletter depends on interests
                 st.success(f"Got it, {prof['name']}! Interests: "
@@ -297,7 +338,7 @@ def render_cv_form(profile):
                 st.rerun()
 
 
-def render_profile_rail():
+def render_profile_rail(llm):
     profile = na.load_cv_profile()
     name = (profile or {}).get("name") or "Guest"
     initial = (name.strip()[:1] or "?").upper()
@@ -312,7 +353,7 @@ def render_profile_rail():
     </div>
     """), unsafe_allow_html=True)
 
-    render_cv_form(profile)
+    render_cv_form(profile, llm)
 
     history = na.load_recent_history()
     current = na.peek_current_issue()
@@ -329,8 +370,7 @@ def render_profile_rail():
     else:
         stats_line = "No searches logged in this local session yet."
     summary_line = (current["interest_summary"] if current else
-                    "Generate the newsletter to see your compacted context "
-                    "here.")
+                    "Generate an issue to see what it focuses on here.")
 
     badge = "Active" if (interests or history) else "Getting started"
     st.markdown(textwrap.dedent(f"""
@@ -344,40 +384,126 @@ def render_profile_rail():
     """), unsafe_allow_html=True)
 
 
-def _generate_with_status(force=False):
-    with st.status("Preparing your newsletter (local LLM, this may take a "
-                   "moment)...", expanded=True) as status:
+def _generate_with_status(llm, build):
+    """Run one newsletter build — `build(progress)` — inside a status box that
+    shows the pipeline's steps. Returns the issue, or None on failure."""
+    with st.status(f"Preparing your newsletter with "
+                   f"{_model_name(llm['model'])}...", expanded=True) as status:
         try:
-            issue = na.generate_weekly_newsletter(
-                force=force, progress=lambda msg: status.write(msg))
+            issue = build(lambda msg: status.write(msg))
         except Exception as e:
             status.update(label="Generation failed", state="error")
-            st.error(f"Couldn't build the newsletter right now: {e}\n\n"
-                     "arXiv may be rate-limiting requests — wait a minute and "
-                     "try again.")
+            st.error(f"Couldn't build the newsletter: {na.friendly_error(e)}")
             return None
         status.update(label="Newsletter ready ✔", state="complete")
     return issue
 
 
-def _render_issue(issue):
-    """Display an already-generated newsletter issue (no generation here)."""
+def render_generator(llm, profile, has_issue):
+    """Build a new issue — from the saved profile, or from what the user
+    describes. Both run the Claude pipeline in newsletter_agent."""
+    box = (st.expander("✨ Make a new issue") if has_issue
+           else st.container(border=True))
+    with box:
+        mode = st.radio("Build it from",
+                        ["From my profile", "Describe what I want"],
+                        horizontal=True, key="nl_mode",
+                        label_visibility="collapsed")
+        if mode == "From my profile":
+            interests = (profile or {}).get("interests", [])
+            st.caption("Uses the interests from your CV ("
+                       + ", ".join(interests) + ") and your recent searches."
+                       if interests else
+                       "Uses your recent searches — add your CV on the left "
+                       "for more personal picks.")
+            if st.button("✨ Generate from my profile", type="primary",
+                         key="nl_gen_profile"):
+                brief = na.profile_brief(na.load_recent_history(), profile)
+                if _generate_with_status(llm, lambda p: na.build_issue(
+                        brief, source="profile", progress=p, **llm)):
+                    st.rerun()
+        else:
+            request = st.text_area(
+                "What do you want to read about?", key="nl_request",
+                height=110,
+                placeholder=("e.g. Retrieval-augmented generation for medical "
+                             "question answering — especially evaluation and "
+                             "benchmarks. Nothing on computer vision."))
+            if st.button("✨ Generate from my description", type="primary",
+                         key="nl_gen_description"):
+                if not request.strip():
+                    st.warning("Describe what you'd like to read first.")
+                elif _generate_with_status(llm, lambda p: na.build_issue(
+                        request, source="description", progress=p, **llm)):
+                    st.rerun()
+        st.caption(f"Built by {_model_name(llm['model'])} from the latest "
+                   "arXiv papers — takes about 20–40 s.")
+
+
+def _source_line(issue):
+    """How an issue was made, shown under its preview ("" for issues made
+    before the Claude pipeline existed)."""
+    if issue.get("source") == "description":
+        req = " ".join(issue.get("request", "").split())
+        if len(req) > 140:
+            req = req[:140].rsplit(" ", 1)[0] + "…"
+        line = f"From your request: “{req}”"
+    elif issue.get("source") == "profile":
+        line = "From your profile"
+    else:
+        return ""
+    if issue.get("adjustments"):
+        line += f" · refined: “{issue['adjustments'][-1]}”"
+    return line + f" · by {_model_name(issue.get('engine', ''))}"
+
+
+def _render_issue(issue, llm, profile):
+    """Display an already-generated newsletter issue (no generation here),
+    plus the Save / Refine actions."""
+    preview = html.escape(" ".join(issue["preview"].split()))
+    source = _source_line(issue)
+    source_html = (f'<p class="mf-hero-source">{html.escape(source)}</p>'
+                   if source else "")
     st.markdown(textwrap.dedent(f"""
     <div class="mf-feed-hero">
       <span class="mf-badge mf-badge-accent">This week · {issue['week_label']}</span>
       <h2>What we picked for you</h2>
-      <p class="mf-hero-preview">{html.escape(issue['preview'])}</p>
+      <p class="mf-hero-preview">{preview}</p>{source_html}
     </div>
     """), unsafe_allow_html=True)
 
     if issue.get("quality_flag"):
         st.caption(f"⚠️ Quality note: {issue['quality_flag']}")
 
-    if st.button("🔄 Regenerate this week"):
-        if _generate_with_status(force=True):
+    if issue.get("source") == "description" and issue.get("plan_interests"):
+        saved = set((profile or {}).get("interests", []))
+        new = [i for i in issue["plan_interests"] if i not in saved]
+        if not new:
+            st.caption("✔ The interests behind this issue are saved in your "
+                       "profile.")
+        elif st.button("💾 Save as my preferences", key="nl_save_prefs",
+                       help="Adds to your profile: " + ", ".join(new)):
+            na.merge_into_profile(new, issue.get("plan_categories", []))
+            st.session_state.nl_flash = ("Saved to your profile: "
+                                         + ", ".join(new) + ".")
             st.rerun()
 
-    st.markdown("**🔝 Top 10 for you**")
+    if llm and issue.get("request"):
+        with st.form("nl_refine", border=False):
+            c1, c2 = st.columns([5, 1], vertical_alignment="bottom")
+            adjustment = c1.text_input(
+                "Adjust this issue",
+                placeholder="e.g. more on benchmarks, no survey papers")
+            refine = c2.form_submit_button("↻ Refine",
+                                           use_container_width=True)
+        if refine:
+            if not adjustment.strip():
+                st.warning("Say what you'd like to change first.")
+            elif _generate_with_status(llm, lambda p: na.refine_issue(
+                    issue, adjustment, progress=p, **llm)):
+                st.rerun()
+
+    st.markdown(f"**🔝 Top {len(issue['items'])} for you**")
     for i, item in enumerate(issue["items"], start=1):
         c1, c2 = st.columns([5, 1], vertical_alignment="center")
         with c1:
@@ -408,11 +534,21 @@ def _render_past_issues():
                 st.markdown(f"- **{it['title']}** — {it.get('summary', '')}")
 
 
-def render_newsletter_main():
-    """Right-hand area. Never generates on load — waits for the user to press
-    the generate button. If this week's issue is already cached, it's shown."""
+def render_newsletter_main(llm):
+    """Right-hand area. Never generates on load — waits for the user to pick
+    how to build the issue and press generate. A cached issue is shown."""
     profile = na.load_cv_profile()
     current = na.peek_current_issue()          # reads cache, no generation
+
+    flash = st.session_state.pop("nl_flash", None)
+    if flash:
+        st.success(flash)
+
+    if llm is None:
+        st.info("✉️ The newsletter is written by Claude, so it needs an "
+                "Anthropic API key. Add `ANTHROPIC_API_KEY = \"sk-ant-...\"` "
+                "to `.streamlit/secrets.toml` (or to the app's Secrets on "
+                "Streamlit Cloud) and reload the page.")
 
     if current is None:
         name = (profile or {}).get("name") or ""
@@ -422,23 +558,16 @@ def render_newsletter_main():
           <span class="mf-badge mf-badge-accent">Your weekly digest</span>
           <h2>{html.escape(greeting)}</h2>
           <p class="mf-hero-preview">We'll scan the latest arXiv papers and
-          curate a personalised top 10 based on your CV interests and recent
-          searches. Nothing runs until you press generate.</p>
+          curate a personalised top 10 — from your profile, or from whatever
+          you describe. Nothing runs until you press generate.</p>
         </div>
         """), unsafe_allow_html=True)
-
-        if profile is None:
-            st.info("👈 Add your CV on the left to personalise the digest — "
-                    "or generate one from your recent searches.")
-        else:
-            st.caption("Using the CV profile on the left. Update it anytime, "
-                       "then regenerate.")
-
-        if st.button("✨ Generate my newsletter", type="primary"):
-            if _generate_with_status(force=False):
-                st.rerun()
+        if llm:
+            render_generator(llm, profile, has_issue=False)
     else:
-        _render_issue(current)
+        if llm:
+            render_generator(llm, profile, has_issue=True)
+        _render_issue(current, llm, profile)
 
     _render_past_issues()
 
@@ -447,14 +576,15 @@ def render_newsletter():
     hide_sidebar()
     top_nav()
     st.title("📰 MindFeed — Personal newsletter")
-    st.caption("Your weekly research pick, generated from the interests in "
-               "your CV and what you search in Explore trends.")
+    st.caption("Your weekly research pick, built by Claude from your profile — "
+               "or from whatever you describe.")
 
+    llm = _claude()
     left_col, main_col = st.columns([1, 2.6], gap="large")
     with left_col:
-        render_profile_rail()
+        render_profile_rail(llm)
     with main_col:
-        render_newsletter_main()
+        render_newsletter_main(llm)
 
 
 # ==========================================================================

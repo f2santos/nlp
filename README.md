@@ -43,34 +43,53 @@ NLP*), optionally refines it with a keyword, and the app:
 
 ### Newsletter pessoal
 
-A second area ("MindFeed" landing page → *Newsletter pessoal*) turns what you
-search in *Explorar tendências* into a personalised weekly digest, generated
-by a small **agentic pipeline** (`newsletter_agent.py`):
+A second area ("MindFeed" landing page → *Newsletter pessoal*) builds a
+personalised weekly digest with **Claude** (Anthropic API), through a small
+**agentic pipeline** (`newsletter_agent.py`). You choose how each issue is
+built:
 
-0. **Profile (optional)** — upload a CV (PDF) in the sidebar; the local LLM
-   extracts your name and a short interest summary/categories/keywords
-   (`analyze_cv`, `data/profile.json` — not committed). This seeds the
-   context below even before you've searched anything, and isn't tied to
-   any one person — whoever uploads a CV on this machine becomes "the
-   profile". Only the derived profile is stored; the PDF itself is not.
-1. **Compact context** — combines the CV profile (if any) with your recent
-   searches (categories/keywords) into a short interest profile.
-2. **Plan queries** — the local LLM decides 1–3 arXiv searches to run for
-   that profile.
-3. **Fetch candidates** — via the same `arxiv_api.collect_papers` used by the
-   search tool.
-4. **Select top 10** — candidates are clustered by sub-topic (reusing
-   `nlp_pipeline.discover_topics`), then the LLM picks a relevant *and*
-   diverse top 10 across clusters.
-5. **Summaries + preview** — one batched LLM call writes a short summary per
-   article plus the week's preview blurb.
-6. **Quality-control loop** — deterministic checks (10 unique items,
-   non-empty summaries) plus one LLM "critic" pass; if either flags issues,
-   the pipeline retries up to 2 times before accepting its best draft.
+- **From my profile** — your CV interests plus your recent searches in
+  *Explore trends*.
+- **Describe what I want** — write what you'd like to read in your own words
+  (e.g. *"RAG for medical question answering, evaluation papers, nothing on
+  computer vision"*) and Claude does the rest.
 
-Results are cached per ISO week under `data/newsletter_cache/`, so opening
-the page is instant except the first time each week (or after clicking
-"Gerar novamente esta semana").
+Steps:
+
+0. **Profile (optional)** — paste or upload a CV (PDF/TXT) on the left;
+   Claude extracts your name, interests and matching arXiv categories
+   (`data/cv_profile.json` — not committed). Only the derived profile is
+   stored; the CV itself is not.
+1. **Understand the request** — Claude turns the profile brief (or your
+   description) into a focus, 1–3 arXiv searches and topics to avoid.
+2. **Fetch candidates** — via the same `arxiv_api.collect_papers` used by the
+   search tool (broadened automatically if too few papers match).
+3. **Cluster** — candidates are grouped by sub-topic with
+   `nlp_pipeline.discover_topics` (TF-IDF + KMeans).
+4. **Select + summarise** — one Claude call picks a relevant *and* diverse
+   top 10 across clusters and writes a one-sentence summary per paper plus
+   the week's preview.
+5. **Quality-control loop** — deterministic checks (10 unique items,
+   non-empty summaries); if they fail, the selection is redone once with the
+   problems listed.
+
+Every Claude call uses **structured outputs** (the reply is parsed straight
+into a pydantic model), so there is no fragile JSON scraping.
+
+After an issue is built you can **↻ Refine** it (*"more on benchmarks, no
+surveys"*) or, for a described issue, **💾 Save as my preferences** to add
+the interests Claude understood to your profile.
+
+Issues are cached per ISO week under `data/newsletter_cache/`, so opening the
+page never calls Claude — only pressing *Generate* or *Refine* does.
+
+**Model & cost.** Claude Haiku 4.5 (`claude-haiku-4-5`) by default — about
+1 cent per issue; production uses Claude Sonnet 5 (`claude-sonnet-5`) —
+about 3–6 cents per issue. An issue takes ~20–40 s, mostly arXiv's
+rate-limit pauses.
+
+**Privacy.** Using the newsletter sends your CV text (when you analyse it),
+your profile brief or your description to the Claude API.
 
 ## How to run locally
 
@@ -84,11 +103,17 @@ streamlit run app.py
 > Requires Python **3.13** (spaCy has no wheels for 3.14 yet). The first run
 > downloads the spaCy and transformers models (1–2 min), then caches them.
 
-> The Newsletter's local LLM (`Qwen/Qwen2.5-1.5B-Instruct`, ~3 GB) downloads
-> the first time you open *Newsletter pessoal*. Each weekly generation runs
-> several sequential local calls (planning, selection, summaries, critique),
-> so it can take **1–3 minutes on CPU** — it's cached per week afterwards, so
-> this only happens once a week (or when you force a regeneration).
+> The newsletter needs an **Anthropic API key**. Create
+> `.streamlit/secrets.toml` (git-ignored) with:
+>
+> ```toml
+> ANTHROPIC_API_KEY = "sk-ant-..."
+> # MINDFEED_CLAUDE_MODEL = "claude-sonnet-5"   # optional; default claude-haiku-4-5
+> ```
+>
+> Environment variables with the same names work too. Without a key,
+> *Explore trends* works as usual and the newsletter page explains how to
+> add one.
 
 > On Windows PowerShell, `source .venv/bin/activate` doesn't exist — either run
 > `.venv\Scripts\Activate.ps1` first, or skip activation and call the venv's
@@ -97,11 +122,14 @@ streamlit run app.py
 ## Free deploy on Streamlit Community Cloud
 
 1. Push these files to a GitHub repo:
-   `app.py`, `arxiv_api.py`, `nlp_pipeline.py`, `requirements.txt`.
+   `app.py`, `arxiv_api.py`, `nlp_pipeline.py`, `newsletter_agent.py`,
+   `requirements.txt`.
 2. Go to https://share.streamlit.io → **New app** → point it at the repo.
 3. Main file path: `app.py`. Click **Deploy**.
-4. First run downloads the models (1–2 min), then caches them.
-5. Copy the public link into the slides and the video.
+4. In the app's **Settings → Secrets**, add `ANTHROPIC_API_KEY = "sk-ant-..."`
+   and `MINDFEED_CLAUDE_MODEL = "claude-sonnet-5"` (production model).
+5. First run downloads the models (1–2 min), then caches them.
+6. Copy the public link into the slides and the video.
 
 > Alternative: Hugging Face Spaces (SDK = Streamlit) works the same way.
 
@@ -112,20 +140,20 @@ streamlit run app.py
 | `app.py`              | Streamlit UI and orchestration                      |
 | `arxiv_api.py`        | Data layer (arXiv API + category taxonomy)          |
 | `nlp_pipeline.py`     | NLP pipeline (keywords, topics, NER, summary, report) |
-| `newsletter_agent.py` | Agentic pipeline behind the personal newsletter (local LLM: context → query planning → selection → summaries → quality-control loop) |
+| `newsletter_agent.py` | Agentic pipeline behind the personal newsletter (Claude: CV reading → request → query planning → fetch → clustering → selection + summaries → quality-control loop) |
 | `requirements.txt`    | Dependencies                                         |
 | `data/`               | Local runtime state: search history, CV-derived profile, weekly newsletter cache. **Not committed** (see `.gitignore`) — it's personal, regenerable, and shouldn't be shared between users. |
 
 ## Notes
 
-- No paid API keys: everything runs on open models — including the
-  Newsletter's LLM (`Qwen/Qwen2.5-1.5B-Instruct`, local via `transformers`).
-  It's a different, larger model than the `distilBART` used for the
-  trend-report summary: that one only needs short extractive-style
-  summarisation, while the newsletter pipeline needs to follow instructions
-  and reliably return structured JSON (query planning, selection, critique).
+- *Explore trends* runs entirely on local open models, with no API key
+  (TF-IDF, KMeans/BERTopic, spaCy, and `distilBART` for the trend-report
+  summary). The **newsletter** uses the Claude API instead: it has to follow
+  instructions and return reliable structured output (query planning,
+  selection, summaries), which small local models did poorly and slowly on
+  CPU.
 - The LLM components (trend-report summary, newsletter pipeline) are
   **optional/isolated** and **complement** the deterministic NLP pipeline —
-  the app still works with the summary checkbox off, or before any
-  newsletter has been generated.
+  the app still works with the summary checkbox off, or without an Anthropic
+  API key (only the newsletter needs it).
 - Simplicity over complexity, as the brief asks.
